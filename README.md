@@ -1,128 +1,226 @@
-1. Projektüberblick
-Dieses Repository implementiert und dokumentiert eine Multi-Branch-Transformer-Architektur (MBT) in Rust, wobei die Parallelität nicht primär als externe Ausführungsstrategie (z. B. reine Pipeline-Partitionierung entlang der Tiefe), sondern als architektonisch explizite Breitenstruktur innerhalb einzelner Layer modelliert wird: Pro Layer werden mehrere Transformer-Blöcke bzw. Block-Sequenzen gleichzeitig ausgeführt, deren Pfadausgaben anschließend durch eine Aggregationsstufe zu einer gemeinsamen Layerrepräsentation fusionieren.
+# Rust_Multi_Branch-Transformer_Architecture
 
-Die technische Motivation ergibt sich aus praktischen Inferenz- und Betriebsengpässen großer Sprachmodelle, die in realen Systemen häufig weniger durch reine FLOP-Komplexität als vielmehr durch Speicherbedarf, Speicherbandbreite, KV-Cache-Management, sowie Kommunikations- und Synchronisationskosten in verteilten Umgebungen bestimmt werden; MBT positioniert die Layerbreite hierbei zugleich als Partitionierungs- und Orchestrierungseinheit für heterogene Infrastruktur, einschließlich Peer-to-Peer-(P2P)-Topologien.
+Implementierung und Referenzdokumentation einer **Multi-Branch-Transformer-Architektur (MBT)** in **Rust**. Der Schwerpunkt liegt auf **intra-layer Parallelität (Width)** mit **expliziter Aggregation**, ergänzt um eine **BPE-Tokenizer-Pipeline**, **Training/Inference** sowie **reproduzierbare Checkpoints** (Tokenizer + Parameter) als geschlossenes, analysierbares System. Die Architektur ist so beschrieben, dass sie als Grundlage für **verteilte Ausführung** (u. a. P2P-Topologien) sowie für **fehlertolerante und kontinuierlich erweiterbare** Transformer-Systeme dient.
 
-Ergänzend adressiert das Projekt drei systemische Zielklassen, die im MBT-Ansatz als konstitutiv betrachtet werden:
+## Inhalt
+- [Motivation und Zielsetzung](#motivation-und-zielsetzung)
+- [Kernidee: Multi-Branch Transformer (MBT)](#kernidee-multi-branch-transformer-mbt)
+- [Features](#features)
+- [Architekturüberblick](#architekturüberblick)
+- [Installation](#installation)
+- [Build und Run](#build-und-run)
+- [Nutzung (CLI)](#nutzung-cli)
+- [Training](#training)
+- [Inference](#inference)
+- [Checkpoints und Reproduzierbarkeit](#checkpoints-und-reproduzierbarkeit)
+- [Verteilte Ausführung und Fault Tolerance (Konzept)](#verteilte-ausführung-und-fault-tolerance-konzept)
+- [Sicherheit und Robustheit (Systemperspektive)](#sicherheit-und-robustheit-systemperspektive)
+- [Abgrenzung zu MoE / Switch / Multi-Path](#abgrenzung-zu-moe--switch--multi-path)
+- [Roadmap](#roadmap)
+- [Zitation](#zitation)
+- [Quellen (APA)](#quellen-apa)
+- [Lizenz](#lizenz)
+- [Kontakt](#kontakt)
 
-Ausfallsicherheit (Fault Tolerance) durch renormalisierte Aggregation bei partieller Pfadverfügbarkeit,
-Continuous Learning trotz asynchroner, zeitvariabler Teilnahme von Pfaden,
-Continuous Expandable Width als kontrollierte, laufende Erweiterbarkeit der Layerbreite durch konservative Gewichtsinjektion und graduelle Regewichtung.
-2. Architekturkonzept: Multi-Branch Transformer (MBT)
-2.1 Grundprinzip: Parallelität als Layerbreite
-In einem MBT-Layer existiert eine Menge paralleler Pfade 
+---
 
-{TBl,1​,…,TBl,K​}, die denselben Layer-Input verarbeiten und Pfadausgaben erzeugen; die Layerausgabe ergibt sich aus einer Aggregation über Gewichte 
-αi(l)​ (nichtnegativ, normiert):
+## Motivation und Zielsetzung
 
-h(l+1)=∑i=1K​αi(l)​zi(l)​.
+Große Transformer-Modelle sind in realen Inferenz-Deployments häufig nicht primär durch Rechenoperationen limitiert, sondern durch **Speicherbedarf**, **Speicherbandbreite**, **KV-Cache-Management** sowie **Kommunikations- und Synchronisationskosten** in verteilten Umgebungen. Klassische Partitionierungen entlang der **Tiefe** reduzieren zwar den Speicherbedarf pro Node, erzwingen jedoch weiterhin eine **sequenzielle Token-Verarbeitungskette** und lassen damit potenzielle Parallelitätsgewinne strukturell ungenutzt, insbesondere in **heterogenen** und **volatilen** Ausführungsumgebungen.
 
-Damit entsteht ein System, in dem gleichzeitige Ausführung nicht als Sonderfall der Infrastruktur, sondern als Bestandteil des Modellgraphen definiert ist, wodurch eine explizite Kopplung zwischen Modellstruktur und Verteilbarkeit möglich wird.
+Das Repository adressiert diese Lage durch eine **Multi-Branch-Topologie**, bei der Parallelität als **Breitenstruktur innerhalb eines Layers** organisiert wird: Mehrere Transformer-Blöcke bzw. Block-Sequenzen werden **zeitgleich** ausgeführt und ihre Pfadausgaben werden anschließend über eine **Aggregationsstufe** fusioniert, was zugleich eine natürliche **Partitionierungs- und Orchestrierungseinheit** für verteilte Ressourcen bereitstellt.
 
-2.2 Aggregation als zentrale Orchestrierungs- und Robustheitskomponente
-Die Aggregationsstufe fungiert nicht nur als numerischer Operator, sondern als systemkritische Komponente, weil sie zugleich folgende Funktionen ermöglicht:
+---
 
-Fusion paralleler Pfadausgaben,
-Pfadgewichtung (statisch oder adaptiv),
-Maskierung und Renormalisierung bei Pfadausfall,
-Governance-Regeln gegen Pfad-Verarmung und Gewichtskollaps,
-potenziell robuste Aggregation gegen byzantinische Ausreißerpfade (z. B. trimmed mean / median-of-means als mögliche Erweiterung).
-3. Verteilte Ausführung im P2P-Setting (Konzept)
-Das Repository orientiert sich an der Prämisse, dass MBT insbesondere in P2P- und heterogenen Netzwerken eine natürliche Zuordnung erlaubt: ein Pfad (Branch) entspricht einer klaren Partitionseinheit, die von einer Node übernommen und ausgeführt werden kann, während ein Aggregationsknoten oder ein verteiltes Aggregationsprotokoll die Ergebnisse fusioniert.
+## Kernidee: Multi-Branch Transformer (MBT)
 
-Im Unterschied zu rein sequenzieller Block-Verteilung entlang der Tiefe (die vor allem Speicher pro Node reduziert, jedoch typischerweise keinen parallelen Token-Speedup liefert), kann MBT potenziell die kritische Pfadlänge reduzieren, sofern Straggler- und Netzwerk-Overheads operativ kontrolliert werden (z. B. über Quorum/Timeout-Regeln).
+Ein MBT-Layer enthält eine Menge paralleler Pfade \( \{TB_{l,1}, \dots, TB_{l,K}\} \), die denselben Layer-Input verarbeiten und Pfadausgaben \( z_i^{(l)} \) erzeugen; die Layerausgabe entsteht als gewichtete Aggregation
 
-4. Trainingslogik: Tiefe vs. Breite
-4.1 Tiefentraining (Depth)
-Die Tiefe bleibt als sequenzielle Layerkette kompatibel mit klassischer Backpropagation; das Projekt übernimmt daher das übliche Prinzip schichtweiser Fehlerpropagation.
+\[
+h^{(l+1)} = \sum_{i=1}^{K} \alpha_i^{(l)} \, z_i^{(l)}, \quad \alpha_i^{(l)} \ge 0, \quad \sum_{i=1}^{K} \alpha_i^{(l)} = 1.
+\]
 
-4.2 Breitentraining (Width)
-Das Breitentraining erfordert zusätzlich Mechanismen, um parallele Pfade stabil und kapazitätserhaltend zu optimieren, insbesondere um:
+Diese Aggregation fungiert als zentrale Systemkomponente, weil sie zugleich **Fusion**, **Gewichtung**, **Ausfallbehandlung** (Maskierung/Renormalisierung) sowie **Governance-Regeln** gegen Pfad-Verarmung und Gewichtskollaps strukturell ermöglicht.
 
-Pfad-Verarmung (untertrainierte Pfade) zu verhindern,
-Dominanz einzelner Pfade (Weight-Collapse) zu vermeiden,
-die Abhängigkeit von singulären Bewertungsregeln zu reduzieren.
-Ein etabliertes Leitprinzip besteht in einer adaptiven Gewichtung der Pfade mit Mindestbeteiligung, sodass jeder Pfad nichttriviale Gradientenexposition erhält und im Ausfallfall nicht bloß „kalte Redundanz“ darstellt.
+---
 
-5. Ausfallsicherheit (Fault Tolerance)
-MBT modelliert Ausfallrobustheit über eine Maskierungsvariable 
+## Features
 
-mi(l)​∈{0,1} und eine renormalisierte Gewichtung:
-α~i(l)​=∑j=1K​mj(l)​αj(l)​mi(l)​αi(l)​​(sofern Nenner>0),h~(l+1)=∑i=1K​α~i(l)​zi(l)​.
+- **Multi-Branch Transformer Layer** (Width-Parallelität mit Aggregation)
+- **BPE Tokenizer** mit persistierter Konfiguration für deterministische Rekonstruktion
+- **Training Loop** für autoregressives Next-Token-Training (Pretraining und Instruction-Tuning als Varianten)
+- **Inference** (greedy decoding; je nach Stand optional Temperature / top-k / top-p)
+- **Checkpointing**: Speichern und Laden von Tokenizer + Modellparametern
+- **Load with Rebuild**: Rekonstruktion des Modells anhand der im Checkpoint gespeicherten Vokabulargröße zur Vermeidung von Shape-Mismatches
+- **Robustheitsmechanismen** (u. a. Validierungen, Parameterlängenprüfungen, atomare Writes; abhängig vom Implementationsstand)
 
-Damit bleibt die Layerfunktion wohldefiniert, solange pro Layer mindestens ein Pfad verfügbar ist; die Systemqualität degradiert kontrolliert in Abhängigkeit der entfernten Gewichtmasse, sofern Governance-Regeln (Mindestbeteiligung, Normkontrolle, Quorum/Timeout) implementiert sind.
+---
 
-6. Continuous Learning und Continuous Expandable Width
-6.1 Continuous Learning (asynchron, partiell)
-Continuous Learning wird als Training unter zeitvariabler Menge aktiver Pfade modelliert; Updates sind damit auch bei partieller Teilnahme formulierbar, sofern Teilnahmeasymmetrien kompensiert werden (z. B. durch pfadspezifische Skalierung der Lernrate) und Vergessen durch geeignete Regularisierung kontrolliert wird.
+## Architekturüberblick
 
-6.2 Continuous Expandable Width (kontinuierliche Breiten-Erweiterung)
-Neue Pfade werden im laufenden Betrieb als zusätzliche Branches integriert, wobei eine konservative Gewichtsinjektion den Funktionssprung begrenzt; ein typisches Schema lautet mit Injektionsrate 
-β∈(0,1):
+Die Codebasis folgt einem „self-contained“-Ansatz, bei dem Tokenisierung, Modell, Training, Inferenz und Persistenz in einem nachvollziehbaren Workflow integriert sind. Typische Komponenten sind:
 
-bestehende Pfade: 
-αi′​=(1−β)αi​
-neue Pfade (uniform): 
-αj′​=β/M
-Die operative Zielsetzung besteht darin, neue Rechenressourcen unmittelbar in zusätzliche Modellkapazität zu überführen, ohne einen disruptiven Neustart der Gesamtarchitektur zu erzwingen.
+- **Tokenizer**: BPE-Training, Encode/Decode, persistierte Tokenizer-Konfiguration
+- **Model Core**: Embeddings, Self-Attention, Feed-Forward, LayerNorm, Transformer-Blöcke
+- **MBT-Erweiterung**: parallele Branches pro Layer und Aggregationslogik
+- **Optimierung**: z. B. Adam; optional Gradient Clipping
+- **Persistenz**: Checkpoint-Format mit Versionierung/Magic-Value und atomarem Schreiben
 
-7. Implementationsumfang (Rust): Komponenten und Module
-Das Repository folgt einem „self-contained“-Ansatz und integriert die Kernbestandteile eines kompakten LLM-Stacks, wobei die MBT-Architektur als Erweiterungs- und Strukturprinzip über den Transformer-Layer gelegt wird.
+Hinweis: Die konkreten Modul- und Dateinamen sind abhängig vom aktuellen Repository-Stand; die README beschreibt das Zielbild konsistent mit den bereitgestellten Textgrundlagen.
 
-Typischerweise umfasst die Codebasis folgende Funktionsbereiche (die konkrete Dateistruktur kann projektspezifisch abweichen):
+---
 
-Core-Layer/Model: Embeddings, Self-Attention, Feed-Forward, LayerNorm, Transformer-Block, Output Projection, sowie MBT-spezifische Branch- und Aggregationslogik.
-Tokenizer: Byte Pair Encoding (BPE) mit deterministischer Trainingskonfiguration.
-Training: autoregressives Next-Token-Training (Pretraining und Instruction-Tuning als Varianten desselben Loops), Optimizer (z. B. Adam) und numerische Stabilitätsmechanismen (z. B. Gradient Clipping).
-Inference: greedy decoding sowie optional temperature / top-k / top-p (abhängig vom Stand des Implementationsumfangs).
-Checkpoints: robustes Speichern/Laden inkl. Tokenizer- und Modellparametern in konsistentem Format, mit Fokus auf Reproduzierbarkeit und Formkompatibilität.
-8. Checkpoints und Determinismus: „Load with Rebuild“
-Ein zentraler Kompatibilitätsaspekt ergibt sich aus der Abhängigkeit der Output-Projektion von der Vokabulargröße (Shape: 
-[demb​,∣V∣]); daher wird ein Verfahren eingesetzt, das beim Laden:
+## Installation
 
-Checkpoint validiert (Version/Magic),
-Tokenizer rekonstruiert,
-Modell anhand des im Checkpoint gespeicherten Vokabulars neu aufbaut,
-Parameter vektorbasiert einspielt.
-Dieses Vorgehen reduziert Shape-Mismatch-Risiken und unterstützt A/B-Vergleiche durch reproduzierbare Tokenizer-Konfigurationen.
+Voraussetzungen:
+- Rust (stable)
+- Cargo
 
-9. Build, Run und Nutzung (CLI-orientiert)
-9.1 Voraussetzungen
-Rust stable toolchain
-Cargo
-9.2 Build
-cargo build --release
+Optional (empfohlen für Entwicklung):
+- `rustfmt`
+- `clippy`
 
-9.3 Run
-cargo run --release
+---
 
-Je nach Implementationsstand stellt eine CLI typischerweise Funktionen bereit, die Training, Speichern, Laden sowie Prompt-basierte Inferenz unterstützen.
+## Build und Run
 
-10. Sicherheit und Robustheit (Systemperspektive)
-Für verteilte MBT-Setups gilt Sicherheit nicht als optionaler Zusatz, sondern als systemische Voraussetzung, da Branches als Angriffspunkte fungieren können (Byzantinische Outputs, Poisoning, Straggling/DoS). Wesentliche Schutzklassen umfassen:
+Build (Release):
+- `cargo build --release`
 
-Integrität von Modellartefakten (Hashing, Signaturen, Versionierung),
-Quorum-/Timeout-Policies gegen Tail-Latency und Straggling,
-Norm- und Gewichtskontrollen in der Aggregation,
-optional: Governance- und Audit-Schicht (z. B. Blockchain-basierte Registry/Attestation in erweiterten Zielarchitekturen).
-Die On-Chain-Ausführung des Modells ist dabei nicht zwingend, während eine Chain als manipulationsresistenter Ordnungsrahmen für Identität, Artefakt-Hashes, Update-Freigaben und Sanktionen dienen kann.
+Run:
+- `cargo run --release`
 
-11. Abgrenzung zu MoE / Switch / „Multi-Path“
-MBT unterscheidet sich konzeptionell und technisch von sparsely-gated MoE-Ansätzen und Switch-Transformern, die Breite primär als tokenweises Routing auf wenige aktivierte Expert*innen realisieren, während MBT Breite als gleichzeitig aktive Pfade pro Layer mit expliziter Aggregation definiert; zugleich unterscheidet sich MBT von „Multi-Path“-Interpretationen residualer Netze, weil Mehrpfadigkeit nicht bloß analytisch, sondern strukturell und orchestrationstauglich implementiert ist (Shazeer et al., 2017; Fedus et al., 2022; Veit et al., 2016).
+---
 
-12. Roadmap (technisch, erweiterungsorientiert)
-Je nach aktuellem Stand sind typische nächste Schritte:
+## Nutzung (CLI)
 
-Effiziente Inferenz: KV-Cache, Batching, Maskierung, Mixed Precision.
-Verteilungsruntime: Branch-Discovery, Scheduling, Quorum-basierte Aggregation, Straggler-Management.
-Robuste Aggregation: Ausreißerresistenz, Reputations-/Trust-Gewichte, Mindestbeteiligungs-Governance.
-Continuous Learning Governance: Update-Validierung, Rollback, Poisoning-Detektion.
-Testbarkeit: Unit-Tests (Tokenizer, Softmax-Stabilität, Checkpoint-Roundtrip), deterministische Golden-Tests.
-13. Lizenz und Kontakt
-Lizenzinformationen sind dem Repository zu entnehmen.
-Kontakt und Projektbezug (gemäß den bereitgestellten Materialien): ms...@expchat.ai sowie die verlinkten GitHub-Projekte zur Rust-basierten LLM- und verteilten GPT-Node-Implementierung.
+Das Projekt ist typischerweise CLI-orientiert und stellt (je nach Stand) folgende Flows bereit:
+- Training starten (Pretraining / Instruction-Tuning)
+- Checkpoint speichern
+- Checkpoint laden (inkl. Rebuild)
+- Prompt eingeben und Antwort generieren
 
+Die konkreten Kommandos, Flags und Menüeinträge sind in `main.rs` bzw. der jeweiligen CLI-Definition zu prüfen.
 
-Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538.
+---
 
-Veit, A., Wilber, M. J., & Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In Advances in Neural Information Processing Systems.
+## Training
+
+Das Training folgt dem autoregressiven Next-Token-Schema: Eingabetokens und Zieltokens entstehen durch eine um 1 verschobene Sequenz, der Loss wird über Cross-Entropy berechnet, und die Gradienten werden per Backpropagation propagiert. In der MBT-Variante ist zusätzlich relevant, dass die **Breitenpfade** fair und stabil trainiert werden, um **Pfad-Verarmung** zu vermeiden, weil andernfalls redundante Pfade im Ausfallfall keine funktionale Ersatzfähigkeit besitzen.
+
+Je nach Konfiguration sind folgende Aspekte zentral:
+- Sequenzlängenbegrenzung (z. B. `MAX_SEQ_LEN`)
+- (Optional) Gradient Clipping zur Stabilisierung kleiner, nicht optimierter Implementationen (Pascanu et al., 2013)
+- (Optional) Mini-Batching/Gradient Accumulation (Roadmap, falls noch nicht umgesetzt)
+
+---
+
+## Inference
+
+Inference erfolgt im einfachsten Modus über **greedy decoding**: das wahrscheinlichste Folgetoken wird iterativ ausgewählt, bis EOS erreicht ist oder die maximale Sequenzlänge greift. Sampling-Verfahren wie Temperature / top-k / top-p können je nach Implementationsstand ergänzt oder bereits vorhanden sein; in der Literatur gelten sie als praxisrelevant für Textqualität (Holtzman et al., 2020).
+
+---
+
+## Checkpoints und Reproduzierbarkeit
+
+### Warum „Load with Rebuild“ erforderlich ist
+
+Die Output-Projektion besitzt typischerweise die Form \([d_{\text{emb}}, |V|]\), wobei \(|V|\) direkt von der Tokenizer-Vokabulargröße abhängt. Wird beim Laden ein Tokenizer mit anderer Vokabulargröße verwendet, entstehen Shape-Mismatches.
+
+Daher implementiert das System beim Laden (konzeptionell) folgende Schritte:
+1. Checkpoint laden und validieren (Magic/Version)
+2. Tokenizer aus Checkpoint rekonstruieren
+3. Modell **neu aufbauen** (Rebuild) anhand \(|V|\) aus dem Checkpoint
+4. Parametervektor einspielen und Länge/Form prüfen
+
+### Atomare Writes
+
+Beim Speichern wird eine atomare Write-Strategie (Temp-Datei + Rename) eingesetzt, um inkonsistente Checkpoints bei Abbruch oder Systemstörungen zu vermeiden.
+
+---
+
+## Verteilte Ausführung und Fault Tolerance (Konzept)
+
+Die Multi-Branch-Struktur ist so modelliert, dass **ein Pfad** als **Partitionseinheit** auf unterschiedliche Nodes gelegt werden kann, während eine Aggregationsinstanz die Pfadausgaben fusioniert. Für Ausfallsicherheit wird eine Maskierung \(m_i^{(l)} \in \{0,1\}\) verwendet; die Gewichte werden im Ausfallfall renormalisiert:
+
+\[
+\tilde{\alpha}_i^{(l)} = \frac{m_i^{(l)} \alpha_i^{(l)}}{\sum_{j=1}^{K} m_j^{(l)} \alpha_j^{(l)}} \quad (\text{sofern Nenner} > 0),
+\quad
+\tilde{h}^{(l+1)} = \sum_{i=1}^{K} \tilde{\alpha}_i^{(l)} z_i^{(l)}.
+\]
+
+Damit bleibt die Layerfunktion wohldefiniert, solange mindestens ein Pfad verfügbar ist. In P2P-Settings sind Quorum-/Timeout-Policies sowie Anti-Weight-Collapse-Regeln methodisch zentral, um Tail-Latency und Single-Point-of-Failure-Effekte zu begrenzen.
+
+---
+
+## Sicherheit und Robustheit (Systemperspektive)
+
+In offenen oder teiloffenen verteilten Umgebungen erhöhen parallele Pfade die Angriffsfläche (Byzantinische Outputs, Straggling/DoS, Update-Poisoning). Ein MBT-System benötigt daher typischerweise:
+- Integrität von Modellartefakten (Hashes/Signaturen/Versionierung)
+- Quorum-/Timeout-Policies gegen Straggler-Tail-Latency
+- Norm- und Gewichtskontrollen in der Aggregation
+- (Optional) Admission Control für neue Pfade bei „Continuous Expandable Width“
+
+Eine Blockchain kann konzeptionell als Governance- und Audit-Schicht dienen, ist jedoch nicht als Ausführungsumgebung des Modells intendiert, sondern als Root-of-Trust für Identität, Artefakt-Hashes und Update-Freigaben.
+
+---
+
+## Abgrenzung zu MoE / Switch / Multi-Path
+
+- **MoE/Switch**: Breite wird primär über **sparsames, tokenweises Routing** auf wenige Expert*innen realisiert; Ziel ist Parameter-Skalierung bei begrenztem Compute pro Token (Shazeer et al., 2017; Fedus et al., 2022).
+- **Multi-Path (Residual-Interpretation)**: beschreibt Mehrpfadigkeit eher analytisch als explizite, orchestrierbare Parallelstruktur (Veit et al., 2016).
+- **MBT**: definiert Mehrpfadigkeit als **gleichzeitig aktive Pfade pro Layer** mit **expliziter Aggregation**, wodurch Verteilbarkeit, Robustheit und kontinuierliche Erweiterbarkeit systematisch adressiert werden.
+
+---
+
+## Roadmap
+
+Mögliche nächste Schritte (abhängig vom aktuellen Stand):
+- **Effiziente Inferenz**: KV-Cache, Batching, Maskierung, Mixed Precision
+- **Verteilungsruntime**: Branch-Discovery, Scheduling, Quorum-basierte Aggregation, Straggler-Management
+- **Robuste Aggregation**: trimmed mean / median-of-means, Reputationsgewichte, Anti-Verarmungs-Governance
+- **Continuous Learning Governance**: Update-Validierung, Rollback, Poisoning-Detektion
+- **Tests**: Tokenizer-Determinismus, Softmax-Stabilität, Checkpoint-Roundtrip, Golden-Tests
+
+---
+
+## Zitation
+
+Wenn Inhalte aus dem Projekt zitiert werden, wird eine Referenz auf dieses Repository sowie auf die im Projektkontext genannten Quellen empfohlen (siehe unten).
+
+---
+
+## Quellen (APA)
+
+Dean, J., Corrado, G., Monga, R., Chen, K., Devin, M., Le, Q. V., Mao, M. Z., Ranzato, M., Senior, A., Tucker, P., Yang, K., & Ng, A. Y. (2012). Large scale distributed deep networks. In *Advances in Neural Information Processing Systems*.
+
+Fedus, W., Zoph, B., & Shazeer, N. (2022). Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. *Journal of Machine Learning Research, 23*(120), 1–39.
+
+Goodfellow, I., Bengio, Y., & Courville, A. (2016). *Deep learning*. MIT Press.
+
+Holtzman, A., Buys, J., Du, L., Forbes, M., & Choi, Y. (2020). The curious case of neural text degeneration. In *International Conference on Learning Representations*.
+
+Pascanu, R., Mikolov, T., & Bengio, Y. (2013). On the difficulty of training recurrent neural networks. In *International Conference on Machine Learning*.
+
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. *arXiv preprint arXiv:1701.06538*.
+
+Veit, A., Wilber, M. J., & Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In *Advances in Neural Information Processing Systems*.
+
+---
+
+## Lizenz
+
+Siehe `LICENSE` im Repository.
+
+---
+
+## Kontakt
+
+- Kontakt: mschlieper@expchat.ai
+- Verwandte Implementationen/Referenzen (Projektumfeld):
+  - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
+  - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
+--- 
+
+Wenn die README vollständig an die reale Repository-Struktur (konkrete Modulnamen, CLI-Flags, Pfade, Beispielkommandos, Datenformate, aktuelle Feature-Flags) angepasst werden soll, werden die aktuellen Dateien `Cargo.toml`, `src/`-Baum sowie ggf. vorhandene CLI-Hilfeausgabe benötigt.
