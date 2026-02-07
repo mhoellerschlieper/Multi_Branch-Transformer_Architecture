@@ -27,7 +27,7 @@ Implementation and reference documentation of a **Multi-Branch Transformer Archi
 
 
 
-In real inference deployments, large transformer models are often not primarily limited by compute operations, but by **memory footprint**, **memory bandwidth**, **KV-cache management**, and **communication and synchronization costs** in distributed environments. Classical partitioning along **depth** does reduce memory requirements per node, but it still enforces a **sequential token-processing chain**, leaving potential parallelism gains structurally underutilized&mdash;particularly in **heterogeneous** and **volatile** execution environments.
+In real inference deployments, large transformer models are often not primarily limited by compute operations, but by **memory footprint**, **memory bandwidth** and **communication and synchronization costs** in distributed environments. Classical partitioning along **depth** does reduce memory requirements per node, but it still enforces a **sequential token-processing chain**, leaving potential parallelism gains structurally underutilized&mdash;particularly in **heterogeneous** and **volatile** execution environments.
 
 This repository addresses this situation via a **multi-branch topology** in which parallelism is organized as a **width structure within a layer**: multiple transformer blocks or block sequences are executed **concurrently**, and their path outputs are subsequently fused through an **aggregation stage**, which simultaneously provides a natural **partitioning and orchestration unit** for distributed resources.
 
@@ -225,6 +225,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
