@@ -41,15 +41,8 @@ h^{(l+1)} = \sum_{i=1}^{K} \alpha_i^{(l)} \, z_i^{(l)}, \quad \alpha_i^{(l)} \ge
 This aggregation functions as a central system component because it structurally enables **fusion**, **weighting**, **failure handling** (masking/renormalization), and **governance rules** against path impoverishment and weight collapse.
 
 ---
-Metric	Symbol / Definition (brief)	Value range	Interpretation (direction)	Good (heuristic)	Acceptable	Poor / Critical	Note (MTB context)
-Path starvation	path_starvation_index = 1 - H(p)/ln(k)	[0, 1]	lower is better (more uniform utilization)	0.00 to 0.10	0.10 to 0.30	poor: 0.30 to 0.60; critical: > 0.60	Uses p_i from score -> softmax; very sensitive for k = 2; indicates collapse risk.
-Diversity (divergence)	diversity_cosine_distance_mean = mean(1 - cos_sim)	[0, 2]	medium is often better; extremely high can be risky	0.20 to 0.80	0.80 to 1.40	redundancy: < 0.20; critical: > 1.40	High distance can cause cancellation under mean aggregation, but not necessarily.
-Effective number of paths	effective_num_paths = exp(H(p))	[1, k]	higher is better (broader utilization)	>= 0.90 * k	0.70k to 0.90k	poor: 0.40k to 0.70k; critical: < 0.40*k	Perplexity analogue; derived directly from entropy.
-Concentration (Gini)	gini_concentration (over p_i)	[0, 1]	lower is better (less imbalance)	0.00 to 0.05	0.05 to 0.15	poor: 0.15 to 0.30; critical: > 0.30	Robust to small deviations, but still sensitive for k = 2.
-Top-1 dominance	top1_share = max(p_i)	[1/k, 1]	closer to 1/k is better	<= (1/k) + 0.02	(1/k) + 0.02 to (1/k) + 0.10	poor: (1/k)+0.10 to (1/k)+0.25; critical: > (1/k)+0.25	Very direct dominance signal; for k = 2, ideal ~ 0.5; critical ~ >= 0.75.
-Top1-Top2 margin	margin_top1_top2 = p_top1 - p_top2	[0, 1]	lower is better	0.00 to 0.02	0.02 to 0.10	poor: 0.10 to 0.30; critical: > 0.30	For k = 2, identical to dominance; for k > 2, differentiates dominance more clearly.
-Scale stability (energy)	output_energy_cv = std(E_i)/mean(E_i)	[0, +inf)	lower is better (no numerical dominance)	0.00 to 0.05	0.05 to 0.15	poor: 0.15 to 0.30; critical: > 0.30	Captures whether one path effectively dominates despite equal weighting (energy proxy).
-Redundancy / correlation	branch_correlation_mean = mean(cos_sim)	[-1, 1]	moderate positive is often good; strongly negative is risky	0.10 to 0.70	-0.10 to 0.10	warning: -0.30 to -0.10; critical: < -0.30	Negative correlation can amplify cancellation under summation/mean aggregation.
+<img width="1228" height="745" alt="grafik" src="https://github.com/user-attachments/assets/2d224c94-1aac-449e-804b-0a957b6774b9" />
+
 ---
 
 ## Features
@@ -230,6 +223,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
