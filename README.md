@@ -22,18 +22,7 @@ Implementation and reference documentation of a **Multi-Branch Transformer Archi
 - [License](#license)
 - [Contact](#contact)
 
----
-| Metrik                         | Symbol / Definition (kurz)                                 | Wertebereich             | Interpretation (Richtung)                          | Gut (heuristisch)                          | Akzeptabel                                 | Schlecht / Kritisch                          | Hinweis (MTB Kontext)                                                                 |
-|-------------------------------|-------------------------------------------------------------|--------------------------|----------------------------------------------------|--------------------------------------------|---------------------------------------------|----------------------------------------------|--------------------------------------------------------------------------------------|
-| Pfadverarmung                 | path_starvation_index = 1 - H(p)/ln(k)                       | [0, 1]                   | kleiner ist besser (gleichmaessige Nutzung)        | 0.00 bis 0.10                              | 0.10 bis 0.30                               | schlecht: 0.30 bis 0.60; kritisch: > 0.60     | Nutzt p_i aus Score->Softmax; bei k=2 sehr sensitiv; zeigt Collapse Risiko.          |
-| Vielfalt (Divergenz)          | diversity_cosine_distance_mean = mean(1 - cos_sim)           | [0, 2]                   | mittel oft besser; extrem hoch kann riskant sein   | 0.20 bis 0.80                              | 0.80 bis 1.40                               | redundanz: < 0.20; kritisch: > 1.40           | Hohe Distanz kann bei Mittelwertaggregation zu Cancellation fuehren, muss aber nicht.|
-| Effektive Pfadanzahl          | effective_num_paths = exp(H(p))                              | [1, k]                   | groesser ist besser (breitere Nutzung)             | >= 0.90 * k                                | 0.70*k bis 0.90*k                            | schlecht: 0.40*k bis 0.70*k; kritisch: <0.40*k| Perplexity Analogie; direkt aus Entropie abgeleitet.                                 |
-| Konzentration (Gini)          | gini_concentration (auf p_i)                                 | [0, 1]                   | kleiner ist besser (weniger Ungleichgewicht)       | 0.00 bis 0.05                              | 0.05 bis 0.15                               | schlecht: 0.15 bis 0.30; kritisch: > 0.30     | Robust gegen kleine Abweichungen, aber bei k=2 ebenfalls empfindlich.                |
-| Dominanz Top1                 | top1_share = max(p_i)                                        | [1/k, 1]                 | naeher an 1/k ist besser                           | <= (1/k) + 0.02                            | (1/k)+0.02 bis (1/k)+0.10                   | schlecht: (1/k)+0.10 bis (1/k)+0.25; kritisch: > (1/k)+0.25 | Sehr direktes Dominanzsignal; fuer k=2 ideal ~0.5, kritisch ~>=0.75.                 |
-| Abstand Top1-Top2             | margin_top1_top2 = p_top1 - p_top2                           | [0, 1]                   | kleiner ist besser                                 | 0.00 bis 0.02                              | 0.02 bis 0.10                               | schlecht: 0.10 bis 0.30; kritisch: > 0.30     | Bei k=2 identisch zur Dominanz; fuer k>2 differenziert es Dominanz klarer.           |
-| Skalenstabilitaet (Energie)   | output_energy_cv = std(E_i)/mean(E_i)                         | [0, +inf)                | kleiner ist besser (keine numerische Dominanz)     | 0.00 bis 0.05                              | 0.05 bis 0.15                               | schlecht: 0.15 bis 0.30; kritisch: > 0.30     | Erfasst, ob ein Pfad bei gleicher Gewichtung faktisch dominiert (Energieproxy).     |
-| Redundanz / Korrelation        | branch_correlation_mean = mean(cos_sim)                      | [-1, 1]                  | moderat positiv oft gut; stark negativ riskant     | 0.10 bis 0.70                              | -0.10 bis 0.10                              | warn: -0.30 bis -0.10; kritisch: < -0.30      | Negative Korrelation kann bei Summation/Mittelwert Ausloeschung verstaerken.         |
-## Motivation and Objectives
+
 
 In real inference deployments, large transformer models are often not primarily limited by compute operations, but by **memory footprint**, **memory bandwidth**, **KV-cache management**, and **communication and synchronization costs** in distributed environments. Classical partitioning along **depth** does reduce memory requirements per node, but it still enforces a **sequential token-processing chain**, leaving potential parallelism gains structurally underutilized&mdash;particularly in **heterogeneous** and **volatile** execution environments.
 
@@ -51,6 +40,16 @@ h^{(l+1)} = \sum_{i=1}^{K} \alpha_i^{(l)} \, z_i^{(l)}, \quad \alpha_i^{(l)} \ge
 
 This aggregation functions as a central system component because it structurally enables **fusion**, **weighting**, **failure handling** (masking/renormalization), and **governance rules** against path impoverishment and weight collapse.
 
+---
+Metric	Symbol / Definition (brief)	Value range	Interpretation (direction)	Good (heuristic)	Acceptable	Poor / Critical	Note (MTB context)
+Path starvation	path_starvation_index = 1 - H(p)/ln(k)	[0, 1]	lower is better (more uniform utilization)	0.00 to 0.10	0.10 to 0.30	poor: 0.30 to 0.60; critical: > 0.60	Uses p_i from score -> softmax; very sensitive for k = 2; indicates collapse risk.
+Diversity (divergence)	diversity_cosine_distance_mean = mean(1 - cos_sim)	[0, 2]	medium is often better; extremely high can be risky	0.20 to 0.80	0.80 to 1.40	redundancy: < 0.20; critical: > 1.40	High distance can cause cancellation under mean aggregation, but not necessarily.
+Effective number of paths	effective_num_paths = exp(H(p))	[1, k]	higher is better (broader utilization)	>= 0.90 * k	0.70k to 0.90k	poor: 0.40k to 0.70k; critical: < 0.40*k	Perplexity analogue; derived directly from entropy.
+Concentration (Gini)	gini_concentration (over p_i)	[0, 1]	lower is better (less imbalance)	0.00 to 0.05	0.05 to 0.15	poor: 0.15 to 0.30; critical: > 0.30	Robust to small deviations, but still sensitive for k = 2.
+Top-1 dominance	top1_share = max(p_i)	[1/k, 1]	closer to 1/k is better	<= (1/k) + 0.02	(1/k) + 0.02 to (1/k) + 0.10	poor: (1/k)+0.10 to (1/k)+0.25; critical: > (1/k)+0.25	Very direct dominance signal; for k = 2, ideal ~ 0.5; critical ~ >= 0.75.
+Top1-Top2 margin	margin_top1_top2 = p_top1 - p_top2	[0, 1]	lower is better	0.00 to 0.02	0.02 to 0.10	poor: 0.10 to 0.30; critical: > 0.30	For k = 2, identical to dominance; for k > 2, differentiates dominance more clearly.
+Scale stability (energy)	output_energy_cv = std(E_i)/mean(E_i)	[0, +inf)	lower is better (no numerical dominance)	0.00 to 0.05	0.05 to 0.15	poor: 0.15 to 0.30; critical: > 0.30	Captures whether one path effectively dominates despite equal weighting (energy proxy).
+Redundancy / correlation	branch_correlation_mean = mean(cos_sim)	[-1, 1]	moderate positive is often good; strongly negative is risky	0.10 to 0.70	-0.10 to 0.10	warning: -0.30 to -0.10; critical: < -0.30	Negative correlation can amplify cancellation under summation/mean aggregation.
 ---
 
 ## Features
@@ -231,6 +230,7 @@ See `LICENSE` in the repository.
 - Related implementations/references (project environment):
   - Rust Distributed GPT Node: https://github.com/mhoellerschlieper/Rust-Distributed-GPT-Node
   - LLM Rust: https://github.com/mhoellerschlieper/LLM_Rust
+
 
 
 
