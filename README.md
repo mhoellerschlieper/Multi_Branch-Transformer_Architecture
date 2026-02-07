@@ -11,53 +11,10 @@ Continuous Expandable Width als kontrollierte, laufende Erweiterbarkeit der Laye
 2. Architekturkonzept: Multi-Branch Transformer (MBT)
 2.1 Grundprinzip: Parallelität als Layerbreite
 In einem MBT-Layer existiert eine Menge paralleler Pfade 
-{
-T
-B
-l
-,
-1
-,
-…
-,
-T
-B
-l
-,
-K
-}
+
 {TBl,1​,…,TBl,K​}, die denselben Layer-Input verarbeiten und Pfadausgaben erzeugen; die Layerausgabe ergibt sich aus einer Aggregation über Gewichte 
-α
-i
-(
-l
-)
 αi(l)​ (nichtnegativ, normiert):
 
-h
-(
-l
-+
-1
-)
-=
-∑
-i
-=
-1
-K
-α
-i
-(
-l
-)
- 
-z
-i
-(
-l
-)
-.
 h(l+1)=∑i=1K​αi(l)​zi(l)​.
 
 Damit entsteht ein System, in dem gleichzeitige Ausführung nicht als Sonderfall der Infrastruktur, sondern als Bestandteil des Modellgraphen definiert ist, wodurch eine explizite Kopplung zwischen Modellstruktur und Verteilbarkeit möglich wird.
@@ -89,82 +46,8 @@ Ein etabliertes Leitprinzip besteht in einer adaptiven Gewichtung der Pfade mit 
 
 5. Ausfallsicherheit (Fault Tolerance)
 MBT modelliert Ausfallrobustheit über eine Maskierungsvariable 
-m
-i
-(
-l
-)
-∈
-{
-0
-,
-1
-}
-mi(l)​∈{0,1} und eine renormalisierte Gewichtung:
 
-α
-~
-i
-(
-l
-)
-=
-m
-i
-(
-l
-)
-α
-i
-(
-l
-)
-∑
-j
-=
-1
-K
-m
-j
-(
-l
-)
-α
-j
-(
-l
-)
-(
-sofern Nenner
->
-0
-)
-,
-h
-~
-(
-l
-+
-1
-)
-=
-∑
-i
-=
-1
-K
-α
-~
-i
-(
-l
-)
-z
-i
-(
-l
-)
-.
+mi(l)​∈{0,1} und eine renormalisierte Gewichtung:
 α~i(l)​=∑j=1K​mj(l)​αj(l)​mi(l)​αi(l)​​(sofern Nenner>0),h~(l+1)=∑i=1K​α~i(l)​zi(l)​.
 
 Damit bleibt die Layerfunktion wohldefiniert, solange pro Layer mindestens ein Pfad verfügbar ist; die Systemqualität degradiert kontrolliert in Abhängigkeit der entfernten Gewichtmasse, sofern Governance-Regeln (Mindestbeteiligung, Normkontrolle, Quorum/Timeout) implementiert sind.
@@ -175,36 +58,11 @@ Continuous Learning wird als Training unter zeitvariabler Menge aktiver Pfade mo
 
 6.2 Continuous Expandable Width (kontinuierliche Breiten-Erweiterung)
 Neue Pfade werden im laufenden Betrieb als zusätzliche Branches integriert, wobei eine konservative Gewichtsinjektion den Funktionssprung begrenzt; ein typisches Schema lautet mit Injektionsrate 
-β
-∈
-(
-0
-,
-1
-)
 β∈(0,1):
 
 bestehende Pfade: 
-α
-i
-′
-=
-(
-1
-−
-β
-)
-α
-i
 αi′​=(1−β)αi​
 neue Pfade (uniform): 
-α
-j
-′
-=
-β
-/
-M
 αj′​=β/M
 Die operative Zielsetzung besteht darin, neue Rechenressourcen unmittelbar in zusätzliche Modellkapazität zu überführen, ohne einen disruptiven Neustart der Gesamtarchitektur zu erzwingen.
 
@@ -220,14 +78,6 @@ Inference: greedy decoding sowie optional temperature / top-k / top-p (abhängig
 Checkpoints: robustes Speichern/Laden inkl. Tokenizer- und Modellparametern in konsistentem Format, mit Fokus auf Reproduzierbarkeit und Formkompatibilität.
 8. Checkpoints und Determinismus: „Load with Rebuild“
 Ein zentraler Kompatibilitätsaspekt ergibt sich aus der Abhängigkeit der Output-Projektion von der Vokabulargröße (Shape: 
-[
-d
-emb
-,
-∣
-V
-∣
-]
 [demb​,∣V∣]); daher wird ein Verfahren eingesetzt, das beim Laden:
 
 Checkpoint validiert (Version/Magic),
@@ -276,3 +126,4 @@ Kontakt und Projektbezug (gemäß den bereitgestellten Materialien): ms...@expch
 Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q., Hinton, G., & Dean, J. (2017). Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538.
 
 Veit, A., Wilber, M. J., & Belongie, S. (2016). Residual networks behave like ensembles of relatively shallow networks. In Advances in Neural Information Processing Systems.
+
