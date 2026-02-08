@@ -364,15 +364,21 @@ fn main() {
                 .map(|s| s.as_str())
                 .collect();
 
+            let pretrain_epochs = 30;
+            let pretrain_learn_rate = 0.0005;
+
+            let train_epochs = 50;
+            let train_learn_rate = 0.0001;
+
             println!("\n=== PRE-TRAINING MODEL ===");
             println!(
                 "Pre-training on {} examples for {} epochs with learning rate {}",
                 dataset.pretraining_data.len(),
-                100,
-                0.0005
+                pretrain_epochs,
+                pretrain_learn_rate
             );
 
-            if let Err(e) = llm.train(v_pretraining_examples, 30, 0.0005) {
+            if let Err(e) = llm.train(v_pretraining_examples, pretrain_epochs, pretrain_learn_rate) {
                 eprintln!("Training failed: {}", e);
                 continue;
             }
@@ -381,11 +387,11 @@ fn main() {
             println!(
                 "Instruction tuning on {} examples for {} epochs with learning rate {}",
                 dataset.chat_training_data.len(),
-                200,
-                0.0001
+                train_epochs,
+                train_learn_rate
             );
 
-            if let Err(e) = llm.train(v_chat_training_examples, 50, 0.0001) {
+            if let Err(e) = llm.train(v_chat_training_examples, train_epochs, train_learn_rate) {
                 eprintln!("Training failed: {}", e);
                 continue;
             }
