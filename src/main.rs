@@ -281,6 +281,12 @@ struct training_metrics_snapshot_ascii {
     i_rows_used_last_epoch: usize,
     i_total_steps: usize,
     s_last_error: String,
+
+    // Diagnostics counters.
+    i_skips_empty_act: usize,
+    i_skips_empty_logits: usize,
+    i_skips_pg_downcast_failed: usize,
+    i_skips_pg_no_branches: usize,
 }
 
 impl training_metrics_snapshot_ascii {
@@ -296,6 +302,12 @@ impl training_metrics_snapshot_ascii {
             i_rows_used_last_epoch: 0,
             i_total_steps: 0,
             s_last_error: "".to_string(),
+
+            // Diagnostics counters.
+            i_skips_empty_act: 0,
+            i_skips_empty_logits: 0,
+            i_skips_pg_downcast_failed: 0,
+            i_skips_pg_no_branches: 0,
         }
     }
 }
@@ -311,10 +323,17 @@ fn print_training_metrics_snapshot_ascii(m: &training_metrics_snapshot_ascii) {
     println!("last_step_loss: {:.6}", m.d_last_step_loss);
     println!("rows_used_last_epoch: {}", m.i_rows_used_last_epoch);
     println!("total_steps: {}", m.i_total_steps);
+
+    println!("skips_empty_act: {}", m.i_skips_empty_act);
+    println!("skips_empty_logits: {}", m.i_skips_empty_logits);
+    println!("skips_pg_downcast_failed: {}", m.i_skips_pg_downcast_failed);
+    println!("skips_pg_no_branches: {}", m.i_skips_pg_no_branches);
+
     if !m.s_last_error.is_empty() {
         println!("last_error: {}", m.s_last_error);
     }
 }
+
 
 fn drain_training_progress_non_blocking(
     opt_rx: &mut Option<mpsc::Receiver<TrainingProgressEventAscii>>,
@@ -343,7 +362,6 @@ fn drain_training_progress_non_blocking(
 
         m.b_running = true;
         m.b_cancel_requested = b_cancel_train.load(Ordering::SeqCst);
-
         m.s_phase = ev.s_phase;
         m.i_epoch_current = ev.i_epoch_current;
         m.i_epochs_total = ev.i_epochs_total;
@@ -351,6 +369,11 @@ fn drain_training_progress_non_blocking(
         m.d_last_step_loss = ev.d_last_step_loss;
         m.i_rows_used_last_epoch = ev.i_rows_used_last_epoch;
         m.i_total_steps = ev.i_total_steps;
+
+        m.i_skips_empty_act = ev.i_skips_empty_act;
+        m.i_skips_empty_logits = ev.i_skips_empty_logits;
+        m.i_skips_pg_downcast_failed = ev.i_skips_pg_downcast_failed;
+        m.i_skips_pg_no_branches = ev.i_skips_pg_no_branches;
     }
 }
 
@@ -519,6 +542,9 @@ fn main() {
             opt_train_handle = Some(thread::spawn(move || {
                 let r_run = (|| -> Result<(), String> {
                     let i_snapshot_every_steps: usize = 200;
+                    let i_epochs_total_pretrain = 30;
+                    let i_epochs_total_train = 5000;
+
 
                     // Phase 1: pretraining.
                     {
@@ -527,7 +553,7 @@ fn main() {
                             .map_err(|_| "metrics_lock_failed".to_string())?;
                         m.s_phase = "pretraining".to_string();
                         m.i_epoch_current = 0;
-                        m.i_epochs_total = 30;
+                        m.i_epochs_total = i_epochs_total_pretrain;
                         m.s_last_error = "".to_string();
                     }
 
@@ -545,7 +571,7 @@ fn main() {
 
                         llm.train_with_progress_continuous_learning_ascii(
                             v_pretraining_examples.iter().map(|s| s.as_str()).collect(),
-                            30,
+                            i_epochs_total_pretrain,
                             0.0005,
                             Arc::clone(&cancel_for_train),
                             tx_progress.clone(),
@@ -567,7 +593,7 @@ fn main() {
                             .map_err(|_| "metrics_lock_failed".to_string())?;
                         m.s_phase = "instruction_tuning".to_string();
                         m.i_epoch_current = 0;
-                        m.i_epochs_total = 50;
+                        m.i_epochs_total = i_epochs_total_train;
                         m.s_last_error = "".to_string();
                     }
 
@@ -583,7 +609,7 @@ fn main() {
 
                         llm.train_with_progress_continuous_learning_ascii(
                             v_chat_training_examples.iter().map(|s| s.as_str()).collect(),
-                            50,
+                            i_epochs_total_train,
                             0.0001,
                             Arc::clone(&cancel_for_train),
                             tx_progress.clone(),
