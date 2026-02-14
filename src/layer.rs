@@ -3,7 +3,7 @@
 //              Implements embeddings, transformer blocks (MHSA + FFN), RMSNorm, output projection,
 //              AdamW optimizer, dropout, and checkpoint save/load.
 //
-//              Adds MTB (multi branch transformer) support via ParallelBlockGroup, which can run
+//              Adds MBT (multi branch transformer) support via ParallelBlockGroup, which can run
 //              branches in parallel (width) and aggregate outputs. Supports branch sequences via
 //              TransformerSequence.
 //
@@ -11,15 +11,30 @@
 //              and additional metrics) and test only fault injection to simulate one dropped path
 //              before each predict.
 //
+//              Continuous learning extensions:
+//              - Partial branch availability via masks
+//              - Inverse participation scaling for unbiased gradient estimates (in expectation)
+//              - Cooperative cancel and progress events
+//              - EMA stabilized branch selection (phase controlled)
+//              - Experience replay buffer (phase controlled)
+//              - Weighted aggregation and conservative injection for autonomous width expansion
+//
 // History:
 // - 2026-02-01: Consolidate project into 6 files: main, layer, train, math, tokenizer, utils.
 // - 2026-02-01: Add checkpoint save and load for model parameters and tokenizer.
 // - 2026-02-04: Add robust sampling (temperature, top k, top p) and ensure predict runs eval mode.
-// - 2026-02-07: Add MTB ParallelBlockGroup and TransformerSequence support.
-// - 2026-02-07: Add MTB diagnostics and test only outage simulation with borrow safe RNG handling.
+// - 2026-02-07: Add MBT ParallelBlockGroup and TransformerSequence support.
+// - 2026-02-07: Add MBT diagnostics and test only outage simulation with borrow safe RNG handling.
 // - 2026-02-08: Add checkpoint topology spec and rebuild model from topology.
+// - 2026-02-11: Parallelize ParallelBlockGroup forward and backward via Rayon.
 // - 2026-02-13: Add cooperative cancel and training progress events for background training.
-// Author: Marcus Schlieper
+// - 2026-02-13: Add selective branch training with EMA loss and replay buffer.
+// - 2026-02-14: Fix progress reporting: compute and report running epoch mean loss in step events.
+// - 2026-02-14: Add phase oriented training strategy with ramp up and autonomous expansion hooks.
+// - 2026-02-14: Add weighted aggregation and conservative injection primitives for branch expansion.
+// - 2026-02-14: Add online training data ingestion via TrainingDataEventAscii (file and rows).
+// Author: Marcus Schlieper (ExpChat.ai)
+#![allow(warnings)]
 
 use std::any::Any;
 use std::cmp::Ordering;
@@ -40,7 +55,7 @@ use crate::tokenizer::{BpeTokenizer, BpeTokenizerCheckpoint, S_EOS};
 use crate::utils;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 pub const DEFAULT_RESIDUAL_DROPOUT_P: f32 = 0.001;
@@ -1392,140 +1407,6 @@ impl ParallelBlockGroupMetrics {
     }
 }
 
-fn sanitize_f32(d_x: f32) -> f32 {
-    if d_x.is_finite() { d_x } else { 0.0 }
-}
-
-fn clamp_prob(d_x: f32) -> f32 {
-    if !d_x.is_finite() {
-        return 0.0;
-    }
-    if d_x < 0.0 {
-        0.0
-    } else if d_x > 1.0 {
-        1.0
-    } else {
-        d_x
-    }
-}
-
-fn entropy_nat(v_p: &[f32]) -> f32 {
-    let mut d_h: f32 = 0.0;
-    for &p in v_p.iter() {
-        let d_p = clamp_prob(p);
-        if d_p > 0.0 {
-            d_h -= d_p * d_p.max(1e-12).ln();
-        }
-    }
-    sanitize_f32(d_h)
-}
-
-fn normalize_distribution(v_x: &[f32]) -> Vec<f32> {
-    if v_x.is_empty() {
-        return Vec::new();
-    }
-    let mut d_sum: f32 = 0.0;
-    for &d in v_x.iter() {
-        d_sum += sanitize_f32(d).max(0.0);
-    }
-    if !d_sum.is_finite() || d_sum <= 0.0 {
-        let d_u = 1.0 / (v_x.len() as f32).max(1.0);
-        return vec![d_u; v_x.len()];
-    }
-    v_x.iter()
-        .map(|&d| sanitize_f32(d).max(0.0) / d_sum)
-        .collect()
-}
-
-fn gini_coefficient(v_p: &[f32]) -> f32 {
-    let i_n = v_p.len();
-    if i_n == 0 {
-        return 0.0;
-    }
-    let mut v = v_p.iter().map(|&x| clamp_prob(x)).collect::<Vec<f32>>();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let d_n = i_n as f32;
-
-    let mut d_sum: f32 = 0.0;
-    for (i, &p) in v.iter().enumerate() {
-        let d_i = i as f32;
-        let d_weight = (d_n - d_i - 0.5) / d_n.max(1.0);
-        d_sum += p * d_weight;
-    }
-
-    let d_g = 1.0 - 2.0 * d_sum;
-    if d_g.is_finite() { d_g.clamp(0.0, 1.0) } else { 0.0 }
-}
-
-fn cosine_similarity(v_a: &[f32], v_b: &[f32]) -> f32 {
-    if v_a.is_empty() || v_b.is_empty() || v_a.len() != v_b.len() {
-        return 0.0;
-    }
-    let mut d_dot: f32 = 0.0;
-    let mut d_na: f32 = 0.0;
-    let mut d_nb: f32 = 0.0;
-
-    for i in 0..v_a.len() {
-        let d_x = sanitize_f32(v_a[i]);
-        let d_y = sanitize_f32(v_b[i]);
-        d_dot += d_x * d_y;
-        d_na += d_x * d_x;
-        d_nb += d_y * d_y;
-    }
-
-    let d_den = (d_na.sqrt() * d_nb.sqrt()).max(1e-12);
-    let d_cos = d_dot / d_den;
-
-    if d_cos.is_finite() { d_cos.clamp(-1.0, 1.0) } else { 0.0 }
-}
-
-fn flatten_array2(a_x: &Array2<f32>) -> Vec<f32> {
-    a_x.iter().map(|&d| sanitize_f32(d)).collect()
-}
-
-fn mean_square_energy(a_x: &Array2<f32>) -> f32 {
-    if a_x.len() == 0 {
-        return 0.0;
-    }
-    let mut d_sum: f32 = 0.0;
-    let mut d_cnt: f32 = 0.0;
-    for &d in a_x.iter() {
-        let d_v = sanitize_f32(d);
-        d_sum += d_v * d_v;
-        d_cnt += 1.0;
-    }
-    let d_m = d_sum / d_cnt.max(1.0);
-    sanitize_f32(d_m)
-}
-
-fn coeff_of_variation(v_x: &[f32]) -> f32 {
-    if v_x.is_empty() {
-        return 0.0;
-    }
-    let mut d_mean: f32 = 0.0;
-    for &d in v_x.iter() {
-        d_mean += sanitize_f32(d);
-    }
-    d_mean /= (v_x.len() as f32).max(1.0);
-
-    if !d_mean.is_finite() || d_mean.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let mut d_var: f32 = 0.0;
-    for &d in v_x.iter() {
-        let d_v = sanitize_f32(d);
-        let d_diff = d_v - d_mean;
-        d_var += d_diff * d_diff;
-    }
-    d_var /= (v_x.len() as f32).max(1.0);
-
-    let d_std = d_var.sqrt();
-    let d_cv = d_std / d_mean.abs();
-
-    if d_cv.is_finite() { d_cv } else { 0.0 }
-}
-
 // ----------------------------------------
 // ParallelBlockGroup (MTB width layer) with diagnostics and test only outage injection
 // ----------------------------------------
@@ -1533,6 +1414,9 @@ fn coeff_of_variation(v_x: &[f32]) -> f32 {
 pub struct ParallelBlockGroup {
     v_branches: Vec<Box<dyn Layer>>,
     d_equal_weight: f32,
+
+    // explicit weights for weighted aggregation and conservative injection.
+    pub v_branch_weights: Vec<f32>,
 
     // Test only fault injection:
     b_fault_injection_enabled: bool,
@@ -1557,10 +1441,12 @@ impl ParallelBlockGroup {
         }
 
         let d_w = 1.0f32 / (v_branches.len() as f32).max(1.0);
+        let v_w = vec![d_w; v_branches.len()];
 
         Ok(Self {
             v_branches,
             d_equal_weight: d_w,
+            v_branch_weights: v_w,
             b_fault_injection_enabled: false,
             opt_fault_drop_branch_idx: None,
         })
@@ -1817,10 +1703,10 @@ impl ParallelBlockGroup {
             let mut v_flat: Vec<Vec<f32>> = Vec::with_capacity(i_k);
 
             for a_y in v_branch_out.iter() {
-                let d_e = mean_square_energy(a_y);
+                let d_e = math::mean_square_energy_f32(a_y);
                 v_scores.push(d_e);
                 v_energy.push(d_e);
-                v_flat.push(flatten_array2(a_y));
+                v_flat.push(math::flatten_array2_f32(a_y));
             }
 
             let a_scores_row = Array2::from_shape_vec((1, v_scores.len()), v_scores.clone())
@@ -1829,17 +1715,17 @@ impl ParallelBlockGroup {
 
             let mut v_p: Vec<f32> = Vec::with_capacity(i_k);
             for i in 0..i_k {
-                v_p.push(clamp_prob(a_p[[0, i]]));
+                v_p.push(math::clamp_prob_f32(a_p[[0, i]]));
             }
-            v_p = normalize_distribution(&v_p);
+            v_p = math::normalize_distribution_f32(&v_p);
 
-            let d_h = entropy_nat(&v_p);
+            let d_h = math::entropy_nat_f32(&v_p);
             let d_h_max = (i_k as f32).max(1.0).ln().max(1e-12);
             let d_h_norm = (d_h / d_h_max).clamp(0.0, 1.0);
             let d_psi = 1.0 - d_h_norm;
 
             let d_eff = d_h.exp().clamp(1.0, i_k as f32);
-            let d_gini = gini_coefficient(&v_p);
+            let d_gini = math::gini_coefficient_f32(&v_p);
 
             let mut v_sorted = v_p.clone();
             v_sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(Ordering::Equal));
@@ -1858,7 +1744,7 @@ impl ParallelBlockGroup {
                     if v_a.len() != v_b.len() || v_a.is_empty() {
                         continue;
                     }
-                    let d_sim = cosine_similarity(v_a, v_b);
+                    let d_sim = math::cosine_similarity_f32(v_a, v_b);
                     let d_dist = 1.0 - d_sim;
                     d_sim_sum += d_sim;
                     d_dist_sum += d_dist;
@@ -1896,20 +1782,190 @@ impl ParallelBlockGroup {
         }
 
         let d_n = (i_used as f32).max(1.0);
-        let d_energy_cv = coeff_of_variation(&v_energy_all);
+        let d_energy_cv = math::coeff_of_variation_f32(&v_energy_all);
 
         Ok(ParallelBlockGroupMetrics {
             i_num_paths: i_k,
             i_num_samples: i_used,
-            d_path_starvation_index: sanitize_f32(d_psi_sum / d_n),
-            d_diversity_cosine_distance_mean: sanitize_f32(d_div_sum / d_n),
-            d_effective_num_paths: sanitize_f32(d_eff_paths_sum / d_n),
-            d_gini_concentration: sanitize_f32(d_gini_sum / d_n),
-            d_top1_share: sanitize_f32(d_top1_sum / d_n),
-            d_margin_top1_top2: sanitize_f32(d_margin_sum / d_n),
-            d_output_energy_cv: sanitize_f32(d_energy_cv),
-            d_branch_correlation_mean: sanitize_f32(d_corr_sum / d_n),
+            d_path_starvation_index: math::sanitize_f32(d_psi_sum / d_n),
+            d_diversity_cosine_distance_mean: math::sanitize_f32(d_div_sum / d_n),
+            d_effective_num_paths: math::sanitize_f32(d_eff_paths_sum / d_n),
+            d_gini_concentration: math::sanitize_f32(d_gini_sum / d_n),
+            d_top1_share: math::sanitize_f32(d_top1_sum / d_n),
+            d_margin_top1_top2: math::sanitize_f32(d_margin_sum / d_n),
+            d_output_energy_cv: math::sanitize_f32(d_energy_cv),
+            d_branch_correlation_mean: math::sanitize_f32(d_corr_sum / d_n),
         })
+    }
+
+
+    // Branch weights w_i >= 0, sum(w_i)=1.
+    // NOTE: This field must be added to the struct definition:
+    // pub v_branch_weights: Vec<f32>,
+
+    fn normalize_branch_weights_ascii(v_w: &mut Vec<f32>) {
+        if v_w.is_empty() {
+            return;
+        }
+
+        let mut d_sum: f32 = 0.0;
+        for w in v_w.iter_mut() {
+            if !w.is_finite() || *w < 0.0 {
+                *w = 0.0;
+            }
+            d_sum += *w;
+        }
+
+        if !d_sum.is_finite() || d_sum <= 0.0 {
+            let d_u = 1.0 / (v_w.len() as f32).max(1.0);
+            for w in v_w.iter_mut() {
+                *w = d_u;
+            }
+            return;
+        }
+
+        for w in v_w.iter_mut() {
+            *w /= d_sum;
+        }
+    }
+
+    pub fn get_branch_weights_ascii(&self) -> Vec<f32> {
+        self.v_branch_weights.clone()
+    }
+
+    pub fn set_branch_weights_ascii(&mut self, v_w: &[f32]) -> Result<(), String> {
+        if v_w.len() != self.v_branches.len() {
+            return Err("parallel_block_group_weights_len_mismatch".to_string());
+        }
+        let mut v_new = v_w.to_vec();
+        Self::normalize_branch_weights_ascii(&mut v_new);
+        self.v_branch_weights = v_new;
+        Ok(())
+    }
+
+    // Conservative weight injection when adding branches:
+    // old weights scaled by (1-eta), new branches share eta uniformly.
+    pub fn add_branches_with_conservative_injection_ascii(
+        &mut self,
+        mut v_new_branches: Vec<Box<dyn Layer>>,
+        d_eta_injection: f32,
+    ) -> Result<(), String> {
+        if v_new_branches.is_empty() {
+            return Err("parallel_block_group_add_branches_empty".to_string());
+        }
+        let d_eta = if d_eta_injection.is_finite() {
+            d_eta_injection.clamp(0.0, 0.5)
+        } else {
+            0.0
+        };
+
+        let i_old = self.v_branches.len();
+        let i_add = v_new_branches.len();
+        let i_new_total = i_old.saturating_add(i_add);
+        if i_new_total == 0 {
+            return Err("parallel_block_group_add_branches_new_total_zero".to_string());
+        }
+
+        // Ensure weights exist.
+        if self.v_branch_weights.len() != i_old {
+            self.v_branch_weights = vec![1.0 / (i_old as f32).max(1.0); i_old.max(1)];
+            Self::normalize_branch_weights_ascii(&mut self.v_branch_weights);
+        }
+
+        // Scale old weights by (1-eta).
+        for w in self.v_branch_weights.iter_mut() {
+            *w *= 1.0 - d_eta;
+        }
+
+        // Append new branches and their initial weights.
+        let d_new_share = if i_add == 0 { 0.0 } else { d_eta / (i_add as f32).max(1.0) };
+        for _ in 0..i_add {
+            self.v_branch_weights.push(d_new_share);
+        }
+
+        self.v_branches.append(&mut v_new_branches);
+
+        Self::normalize_branch_weights_ascii(&mut self.v_branch_weights);
+        Ok(())
+    }
+
+    // Weighted aggregation forward with availability mask.
+    pub fn forward_weighted_with_availability_mask_ascii(
+        &mut self,
+        a_input: &Array2<f32>,
+        v_active_mask: &[bool],
+    ) -> Array2<f32> {
+        if a_input.nrows() == 0 || a_input.ncols() == 0 {
+            return a_input.clone();
+        }
+        if v_active_mask.len() != self.v_branches.len() {
+            return Array2::zeros((0, 0));
+        }
+        if self.v_branch_weights.len() != self.v_branches.len() {
+            return Array2::zeros((0, 0));
+        }
+
+        // Parallel forward on active branches.
+        let v_outs: Vec<Option<Array2<f32>>> = self
+            .v_branches
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i_idx, br)| {
+                if !v_active_mask[i_idx] {
+                    return None;
+                }
+                let a_y = br.forward(a_input);
+                if a_y.nrows() == 0 || a_y.ncols() == 0 {
+                    None
+                } else {
+                    Some(a_y)
+                }
+            })
+            .collect();
+
+        // Weighted sum; renormalize over active weights to preserve scale.
+        let mut opt_sum: Option<Array2<f32>> = None;
+        let mut d_active_w_sum: f32 = 0.0;
+
+        for (i_idx, opt_a) in v_outs.into_iter().enumerate() {
+            let a_y = match opt_a {
+                Some(a) => a,
+                None => continue,
+            };
+            let d_w = self.v_branch_weights[i_idx];
+            if !d_w.is_finite() || d_w <= 0.0 {
+                continue;
+            }
+
+            match &mut opt_sum {
+                None => {
+                    let mut a_first = a_y;
+                    a_first.mapv_inplace(|x| x * d_w);
+                    opt_sum = Some(a_first);
+                }
+                Some(a_acc) => {
+                    if a_acc.raw_dim() != a_y.raw_dim() {
+                        return Array2::zeros((0, 0));
+                    }
+                    *a_acc = &*a_acc + &(a_y.mapv(|x| x * d_w));
+                }
+            }
+
+            d_active_w_sum += d_w;
+        }
+
+        let mut a_out = match opt_sum {
+            None => Array2::zeros((0, 0)),
+            Some(a) => a,
+        };
+
+        // Renormalize to sum of active weights (avoid shrinking when only few paths active).
+        if d_active_w_sum.is_finite() && d_active_w_sum > 1e-12 {
+            let d_inv = 1.0 / d_active_w_sum;
+            a_out.mapv_inplace(|x| x * d_inv);
+        }
+
+        a_out
     }
 }
 
@@ -2070,6 +2126,162 @@ pub enum llm_layer_spec {
     output_projection {
         i_embedding_dim: usize,
     },
+}
+#[derive(Clone, Debug)]
+pub enum TrainingDataEventAscii {
+    // Add a file that contains JSON array of strings (same semantics as existing dataset JSON).
+    add_training_file_json_array { s_path: String },
+
+    // Add already loaded rows directly (each element is one training example string).
+    add_training_rows { v_rows: Vec<String> },
+
+    // Signal shutdown for cooperative termination of ingestion loop.
+    shutdown,
+}
+
+#[derive(Clone, Debug)]
+struct online_data_ingestion_state_ascii {
+    // Safety limits.
+    i_max_file_bytes: usize,
+    i_max_rows_per_event: usize,
+    i_max_total_rows: usize,
+
+    // Diagnostics.
+    i_total_rows_added: usize,
+    i_total_events_processed: usize,
+    i_total_parse_errors: usize,
+    i_total_rows_rejected: usize,
+}
+
+impl online_data_ingestion_state_ascii {
+    fn new_default() -> Self {
+        Self {
+            i_max_file_bytes: 50 * 1024 * 1024,
+            i_max_rows_per_event: 200_000,
+            i_max_total_rows: 5_000_000,
+
+            i_total_rows_added: 0,
+            i_total_events_processed: 0,
+            i_total_parse_errors: 0,
+            i_total_rows_rejected: 0,
+        }
+    }
+}
+
+fn read_json_array_of_strings_file_ascii(
+    s_path: &str,
+    i_max_file_bytes: usize,
+) -> Result<Vec<String>, String> {
+    if s_path.trim().is_empty() {
+        return Err("ingest_path_empty".to_string());
+    }
+
+    let md = std::fs::metadata(s_path).map_err(|_| "ingest_file_metadata_error".to_string())?;
+    let i_len = md.len() as usize;
+    if i_len == 0 {
+        return Err("ingest_file_empty".to_string());
+    }
+    if i_len > i_max_file_bytes {
+        return Err("ingest_file_too_large".to_string());
+    }
+
+    let s_json = std::fs::read_to_string(s_path).map_err(|_| "ingest_file_read_error".to_string())?;
+    if s_json.trim().is_empty() {
+        return Err("ingest_file_read_empty".to_string());
+    }
+
+    let v_data: Vec<String> =
+        serde_json::from_str(&s_json).map_err(|_| "ingest_json_parse_error".to_string())?;
+    Ok(v_data)
+}
+
+fn append_tokenized_rows_ascii(
+    llm: &Llm,
+    v_dst_token_rows: &mut Vec<Vec<usize>>,
+    v_new_rows: &[String],
+    st_ing: &mut online_data_ingestion_state_ascii,
+) {
+    if v_new_rows.is_empty() {
+        return;
+    }
+
+    let i_budget = st_ing
+        .i_max_total_rows
+        .saturating_sub(v_dst_token_rows.len());
+    if i_budget == 0 {
+        st_ing.i_total_rows_rejected = st_ing.i_total_rows_rejected.saturating_add(v_new_rows.len());
+        return;
+    }
+
+    let i_take = v_new_rows
+        .len()
+        .min(st_ing.i_max_rows_per_event)
+        .min(i_budget);
+
+    for s in v_new_rows.iter().take(i_take) {
+        if s.trim().is_empty() {
+            st_ing.i_total_rows_rejected = st_ing.i_total_rows_rejected.saturating_add(1);
+            continue;
+        }
+
+        let r_tok = llm.tokenize(s);
+        let v_ids = match r_tok {
+            Ok(v) => v,
+            Err(_) => {
+                st_ing.i_total_parse_errors = st_ing.i_total_parse_errors.saturating_add(1);
+                continue;
+            }
+        };
+
+        if v_ids.len() < 2 {
+            st_ing.i_total_rows_rejected = st_ing.i_total_rows_rejected.saturating_add(1);
+            continue;
+        }
+
+        v_dst_token_rows.push(v_ids);
+        st_ing.i_total_rows_added = st_ing.i_total_rows_added.saturating_add(1);
+    }
+}
+
+fn drain_training_data_events_non_blocking_ascii(
+    llm: &Llm,
+    opt_rx: &mut Option<Receiver<TrainingDataEventAscii>>,
+    v_tokenized_data: &mut Vec<Vec<usize>>,
+    st_ing: &mut online_data_ingestion_state_ascii,
+) {
+    let rx = match opt_rx.as_mut() {
+        Some(v) => v,
+        None => return,
+    };
+
+    loop {
+        let ev = match rx.try_recv() {
+            Ok(v) => v,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *opt_rx = None;
+                break;
+            }
+        };
+
+        st_ing.i_total_events_processed = st_ing.i_total_events_processed.saturating_add(1);
+
+        match ev {
+            TrainingDataEventAscii::shutdown => {
+                *opt_rx = None;
+                break;
+            }
+            TrainingDataEventAscii::add_training_rows { v_rows } => {
+                append_tokenized_rows_ascii(llm, v_tokenized_data, &v_rows, st_ing);
+            }
+            TrainingDataEventAscii::add_training_file_json_array { s_path } => {
+                match read_json_array_of_strings_file_ascii(&s_path, st_ing.i_max_file_bytes) {
+                    Ok(v_rows) => append_tokenized_rows_ascii(llm, v_tokenized_data, &v_rows, st_ing),
+                    Err(_) => st_ing.i_total_parse_errors = st_ing.i_total_parse_errors.saturating_add(1),
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------
@@ -2335,81 +2547,6 @@ impl PredictStats {
     }
 }
 
-fn sanitize_f32_local(d_x: f32) -> f32 {
-    if d_x.is_finite() { d_x } else { 0.0 }
-}
-
-fn clamp_prob_local(d_x: f32) -> f32 {
-    if !d_x.is_finite() {
-        return 0.0;
-    }
-    if d_x < 0.0 {
-        0.0
-    } else if d_x > 1.0 {
-        1.0
-    } else {
-        d_x
-    }
-}
-
-fn entropy_nat_local(v_p: &[f32]) -> f32 {
-    let mut d_h: f32 = 0.0;
-    for &p in v_p.iter() {
-        let d_p = clamp_prob_local(p);
-        if d_p > 0.0 {
-            d_h -= d_p * d_p.max(1e-12).ln();
-        }
-    }
-    sanitize_f32_local(d_h)
-}
-
-fn top1_top2_margin_local(v_p: &[f32]) -> f32 {
-    if v_p.is_empty() {
-        return 0.0;
-    }
-
-    let mut d_top1: f32 = -1.0;
-    let mut d_top2: f32 = -1.0;
-
-    for &p in v_p.iter() {
-        let d_p = clamp_prob_local(p);
-        if d_p > d_top1 {
-            d_top2 = d_top1;
-            d_top1 = d_p;
-        } else if d_p > d_top2 {
-            d_top2 = d_p;
-        }
-    }
-
-    let d_margin = (d_top1 - d_top2).max(0.0);
-    sanitize_f32_local(d_margin)
-}
-
-fn mean_vec_f32_local(v_x: &[f32]) -> f32 {
-    if v_x.is_empty() {
-        return 0.0;
-    }
-    let mut d_sum: f32 = 0.0;
-    for &d in v_x.iter() {
-        d_sum += sanitize_f32_local(d);
-    }
-    sanitize_f32_local(d_sum / (v_x.len() as f32).max(1.0))
-}
-
-fn compute_perplexity_from_selected_probs_local(v_p_sel: &[f32]) -> f32 {
-    if v_p_sel.is_empty() {
-        return 0.0;
-    }
-
-    let mut d_sum_nll: f32 = 0.0;
-    for &p in v_p_sel.iter() {
-        let d_p = clamp_prob_local(p).max(1e-12);
-        d_sum_nll += -d_p.ln();
-    }
-    let d_mean_nll = d_sum_nll / (v_p_sel.len() as f32).max(1.0);
-    sanitize_f32_local(d_mean_nll.exp())
-}
-
 // -----------------------------
 // Background training support
 // -----------------------------
@@ -2511,11 +2648,129 @@ impl ContinuousLearningConfig {
 }
 
 
-// Helper: compute step loss for a single forward pass.
-// This mirrors math::cross_entropy_loss_step but returns scalar for the current batch.
-fn compute_loss_step_local(a_probs: &Array2<f32>, v_target_ids: &[usize]) -> f32 {
-    math::cross_entropy_loss_step(a_probs, v_target_ids)
+#[derive(Clone, Debug)]
+struct branch_loss_ema_state_ascii {
+    // Exponential moving average per branch. None means uninitialized.
+    v_ema_loss: Vec<Option<f32>>,
+    // Last chosen branch (optional diagnostic).
+    opt_last_selected_branch: Option<usize>,
+    // EMA smoothing factor in (0, 1]. Higher means more reactive.
+    d_alpha: f32,
 }
+
+impl branch_loss_ema_state_ascii {
+    fn new(i_num_branches: usize, d_alpha: f32) -> Self {
+        let d_a = if d_alpha.is_finite() { d_alpha.clamp(0.01, 1.0) } else { 0.2 };
+        Self {
+            v_ema_loss: vec![None; i_num_branches],
+            opt_last_selected_branch: None,
+            d_alpha: d_a,
+        }
+    }
+
+    fn ensure_len(&mut self, i_num_branches: usize) {
+        if self.v_ema_loss.len() == i_num_branches {
+            return;
+        }
+        self.v_ema_loss = vec![None; i_num_branches];
+        self.opt_last_selected_branch = None;
+    }
+
+    fn update_ema(&mut self, i_branch: usize, d_loss: f32) {
+        if i_branch >= self.v_ema_loss.len() {
+            return;
+        }
+        if !d_loss.is_finite() || d_loss < 0.0 {
+            return;
+        }
+
+        let d_alpha = self.d_alpha;
+        match self.v_ema_loss[i_branch] {
+            None => self.v_ema_loss[i_branch] = Some(d_loss),
+            Some(d_prev) => {
+                let d_new = d_alpha * d_loss + (1.0 - d_alpha) * d_prev;
+                self.v_ema_loss[i_branch] = Some(if d_new.is_finite() { d_new } else { d_prev });
+            }
+        }
+    }
+
+    fn get_score_or_fallback(&self, i_branch: usize, d_fallback: f32) -> f32 {
+        if i_branch >= self.v_ema_loss.len() {
+            return d_fallback;
+        }
+        match self.v_ema_loss[i_branch] {
+            Some(v) if v.is_finite() => v,
+            _ => d_fallback,
+        }
+    }
+}
+
+// Description: Patch - Add simple experience replay buffer for continual learning.
+// History:
+// - 2026-02-13: Add replay buffer to reduce catastrophic forgetting.
+// Author: Marcus Schlieper
+
+#[derive(Clone, Debug)]
+struct replay_buffer_ascii {
+    // Stores token id sequences (already truncated to MAX_SEQ_LEN).
+    v_rows: Vec<Vec<usize>>,
+    i_capacity: usize,
+    // Deterministic RNG for sampling.
+    rng: rand::rngs::StdRng,
+}
+
+impl replay_buffer_ascii {
+    fn new(i_capacity: usize, u64_seed: u64) -> Self {
+        let i_cap = if i_capacity > 0 { i_capacity.min(50000) } else { 0 };
+        Self {
+            v_rows: Vec::new(),
+            i_capacity: i_cap,
+            rng: rand::rngs::StdRng::seed_from_u64(u64_seed),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.i_capacity > 0
+    }
+
+    fn len(&self) -> usize {
+        self.v_rows.len()
+    }
+
+    fn push_row(&mut self, v_row: &[usize]) {
+        if !self.is_enabled() {
+            return;
+        }
+        if v_row.len() < 2 {
+            return;
+        }
+        // Copy and cap length defensively.
+        let mut v = v_row.to_vec();
+        if v.len() > crate::MAX_SEQ_LEN {
+            v.truncate(crate::MAX_SEQ_LEN);
+        }
+
+        if self.v_rows.len() < self.i_capacity {
+            self.v_rows.push(v);
+            return;
+        }
+
+        // Ring behavior: overwrite a random slot to avoid bias toward old items.
+        if !self.v_rows.is_empty() {
+            let i_idx = self.rng.gen_range(0..self.v_rows.len());
+            self.v_rows[i_idx] = v;
+        }
+    }
+
+    fn sample_row(&mut self) -> Option<Vec<usize>> {
+        if self.v_rows.is_empty() {
+            return None;
+        }
+        let i_idx = self.rng.gen_range(0..self.v_rows.len());
+        Some(self.v_rows[i_idx].clone())
+    }
+}
+
 // ----------------------------------------
 // Llm
 // ----------------------------------------
@@ -2540,19 +2795,97 @@ pub struct Llm {
     pub b_outage_simulation_enabled: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum training_phase_ascii {
+    warmup,
+    finetune,
+    realtime,
+}
+
+#[derive(Clone, Debug)]
+pub struct phase_strategy_config_ascii {
+    pub e_phase: training_phase_ascii,
+
+    // EMA routing control.
+    pub b_enable_ema_branch_selection: bool,
+    pub i_ema_warmup_steps: usize,
+
+    // Replay control.
+    pub b_enable_replay: bool,
+    pub d_replay_p_start: f32,
+    pub d_replay_p_max: f32,
+    pub i_replay_ramp_steps: usize,
+
+    // Expansion control.
+    pub b_enable_autonomous_expansion: bool,
+    pub i_expand_check_every_steps: usize,
+    pub d_eta_injection: f32,
+
+    // Safety limits.
+    pub i_max_total_branches: usize,
+}
+
+impl phase_strategy_config_ascii {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.i_expand_check_every_steps == 0 {
+            return Err("phase_cfg_expand_check_every_steps_zero".to_string());
+        }
+        if self.i_max_total_branches == 0 {
+            return Err("phase_cfg_max_total_branches_zero".to_string());
+        }
+        if !self.d_eta_injection.is_finite() || self.d_eta_injection < 0.0 || self.d_eta_injection > 0.5 {
+            return Err("phase_cfg_eta_injection_invalid".to_string());
+        }
+        if !self.d_replay_p_start.is_finite() || !self.d_replay_p_max.is_finite() {
+            return Err("phase_cfg_replay_p_non_finite".to_string());
+        }
+        if self.d_replay_p_start < 0.0 || self.d_replay_p_start > 1.0 {
+            return Err("phase_cfg_replay_p_start_invalid".to_string());
+        }
+        if self.d_replay_p_max < 0.0 || self.d_replay_p_max > 1.0 {
+            return Err("phase_cfg_replay_p_max_invalid".to_string());
+        }
+        if self.d_replay_p_start > self.d_replay_p_max {
+            return Err("phase_cfg_replay_p_start_gt_max".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn replay_p_at_step(&self, i_total_steps: usize) -> f32 {
+        if !self.b_enable_replay {
+            return 0.0;
+        }
+        if self.i_replay_ramp_steps == 0 {
+            return self.d_replay_p_max;
+        }
+        let d_t = (i_total_steps as f32) / (self.i_replay_ramp_steps as f32).max(1.0);
+        let d_a = d_t.clamp(0.0, 1.0);
+        let d_p = self.d_replay_p_start + d_a * (self.d_replay_p_max - self.d_replay_p_start);
+        if d_p.is_finite() { d_p.clamp(0.0, 1.0) } else { 0.0 }
+    }
+
+    pub fn ema_is_active(&self, i_total_steps: usize) -> bool {
+        self.b_enable_ema_branch_selection && i_total_steps >= self.i_ema_warmup_steps
+    }
+}
+
+
 impl Llm {
     pub fn new(vocab: Vocab, network: Vec<Box<dyn Layer>>) -> Self {
         Self {
             vocab,
             network,
             bpe_tokenizer: None,
+
             b_training: true,
             u64_dropout_seed: 1337,
             d_residual_dropout_p: DEFAULT_RESIDUAL_DROPOUT_P,
+
             d_temperature: 1.0,
             i_top_k: 0,
             d_top_p: 0.0,
             rng_sampling: StdRng::seed_from_u64(12345),
+
             b_outage_simulation_enabled: false,
         }
     }
@@ -2581,16 +2914,23 @@ impl Llm {
 
     pub fn set_training(&mut self, b_training: bool) {
         self.b_training = b_training;
+
         for layer in self.network.iter_mut() {
             if let Some(tb) = layer.as_any_mut().and_then(|a| a.downcast_mut::<TransformerBlock>()) {
                 tb.set_training(b_training);
                 continue;
             }
-            if let Some(pg) = layer.as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>()) {
+            if let Some(pg) = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+            {
                 pg.set_training(b_training);
                 continue;
             }
-            if let Some(ts) = layer.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+            if let Some(ts) = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<TransformerSequence>())
+            {
                 ts.set_training(b_training);
                 continue;
             }
@@ -2601,16 +2941,23 @@ impl Llm {
         if d_p.is_finite() {
             self.d_residual_dropout_p = d_p.clamp(0.0, 0.95);
         }
+
         for layer in self.network.iter_mut() {
             if let Some(tb) = layer.as_any_mut().and_then(|a| a.downcast_mut::<TransformerBlock>()) {
                 tb.set_residual_dropout_p(self.d_residual_dropout_p);
                 continue;
             }
-            if let Some(pg) = layer.as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>()) {
+            if let Some(pg) = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+            {
                 pg.set_residual_dropout_p(self.d_residual_dropout_p);
                 continue;
             }
-            if let Some(ts) = layer.as_any_mut().and_then(|a| a.downcast_mut::<TransformerSequence>()) {
+            if let Some(ts) = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<TransformerSequence>())
+            {
                 ts.set_residual_dropout_p(self.d_residual_dropout_p);
                 continue;
             }
@@ -2693,8 +3040,8 @@ impl Llm {
 
             if s_t == "TransformerBlock" {
                 v_layers.push(llm_layer_spec::transformer_block {
-                    i_embedding_dim: crate::EMBEDDING_DIM,
-                    i_hidden_dim: crate::HIDDEN_DIM,
+                    i_embedding_dim: EMBEDDING_DIM,
+                    i_hidden_dim: HIDDEN_DIM,
                     i_num_heads: 4,
                 });
                 continue;
@@ -2703,7 +3050,7 @@ impl Llm {
             if s_t == "TransformerSequence" {
                 let ts = layer
                     .as_any_mut()
-                    .and_then(|a| a.downcast_mut::<crate::layer::TransformerSequence>())
+                    .and_then(|a| a.downcast_mut::<TransformerSequence>())
                     .ok_or_else(|| "topology_export_downcast_transformer_sequence_failed".to_string())?;
                 v_layers.push(ts.export_spec());
                 continue;
@@ -2712,24 +3059,26 @@ impl Llm {
             if s_t == "ParallelBlockGroup" {
                 let pg = layer
                     .as_any_mut()
-                    .and_then(|a| a.downcast_mut::<crate::layer::ParallelBlockGroup>())
+                    .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
                     .ok_or_else(|| "topology_export_downcast_parallel_block_group_failed".to_string())?;
 
-                // Export branches including TransformerSequence via downcast on each branch.
                 let mut v_branches: Vec<llm_layer_spec> = Vec::new();
                 for br in pg.v_branches.iter_mut() {
                     let s_bt = br.layer_type();
+
                     if s_bt == "TransformerBlock" {
                         v_branches.push(llm_layer_spec::transformer_block {
-                            i_embedding_dim: crate::EMBEDDING_DIM,
-                            i_hidden_dim: crate::HIDDEN_DIM,
+                            i_embedding_dim: EMBEDDING_DIM,
+                            i_hidden_dim: HIDDEN_DIM,
                             i_num_heads: 4,
                         });
                     } else if s_bt == "TransformerSequence" {
                         let tsb = br
                             .as_any_mut()
-                            .and_then(|a| a.downcast_mut::<crate::layer::TransformerSequence>())
-                            .ok_or_else(|| "topology_export_downcast_branch_transformer_sequence_failed".to_string())?;
+                            .and_then(|a| a.downcast_mut::<TransformerSequence>())
+                            .ok_or_else(|| {
+                                "topology_export_downcast_branch_transformer_sequence_failed".to_string()
+                            })?;
                         v_branches.push(tsb.export_spec());
                     } else {
                         return Err("topology_export_parallel_branch_type_unsupported".to_string());
@@ -2742,7 +3091,7 @@ impl Llm {
 
             if s_t == "OutputProjection" {
                 v_layers.push(llm_layer_spec::output_projection {
-                    i_embedding_dim: crate::EMBEDDING_DIM,
+                    i_embedding_dim: EMBEDDING_DIM,
                 });
                 continue;
             }
@@ -2759,11 +3108,9 @@ impl Llm {
         }
 
         // Step 1: Create topology first (requires &mut self).
-        // This must happen before any long-lived immutable borrows from self.
         let topology = self.export_topology_spec()?;
 
         // Step 2: Materialize tokenizer checkpoint without keeping a borrow alive.
-        // Use a narrow scope so the borrow ends immediately.
         let tokenizer_cp = {
             let tok = self
                 .bpe_tokenizer
@@ -2772,45 +3119,50 @@ impl Llm {
             tok.to_checkpoint()
         };
 
-        // Step 3: Collect parameters (can borrow self immutably; no conflict now).
+        // Step 3: Collect parameters.
         let v_params = self.collect_all_parameters_flat();
 
         let cp = llm_checkpoint_v2::new(
             tokenizer_cp,
             topology,
             v_params,
-            crate::MAX_SEQ_LEN,
-            crate::EMBEDDING_DIM,
-            crate::HIDDEN_DIM,
+            MAX_SEQ_LEN,
+            EMBEDDING_DIM,
+            HIDDEN_DIM,
         );
 
-        let s_json = crate::utils::checkpoint_to_json_ascii(&cp)?;
-        crate::utils::write_file_atomic_ascii(s_path, &s_json)?;
+        let s_json = utils::checkpoint_to_json_ascii(&cp)?;
+        utils::write_file_atomic_ascii(s_path, &s_json)?;
         Ok(())
     }
 
-    pub fn load_checkpoint_llm_checkpoint_v2_rebuild(s_path: &str) -> Result<crate::layer::Llm, String> {
+    pub fn load_checkpoint_llm_checkpoint_v2_rebuild(s_path: &str) -> Result<Llm, String> {
         if s_path.trim().is_empty() {
             return Err("checkpoint_path_empty".to_string());
         }
 
-        let s_json = std::fs::read_to_string(s_path).map_err(|_| "checkpoint_read_error".to_string())?;
-        let cp: llm_checkpoint_v2 = crate::utils::checkpoint_from_json_ascii(&s_json)?;
+        let s_json =
+            std::fs::read_to_string(s_path).map_err(|_| "checkpoint_read_error".to_string())?;
+        let cp: llm_checkpoint_v2 = utils::checkpoint_from_json_ascii(&s_json)?;
         cp.validate()?;
 
-        let bpe = crate::tokenizer::BpeTokenizer::from_checkpoint(&cp.tokenizer)?;
+        let bpe = BpeTokenizer::from_checkpoint(&cp.tokenizer)?;
         let vocab = bpe.vocab.clone();
 
         let network = build_network_from_topology(&cp.topology, &vocab)?;
 
-        let mut llm = crate::layer::Llm::new(vocab, network);
+        let mut llm = Llm::new(vocab, network);
         llm.set_bpe_tokenizer(bpe);
 
         llm.set_residual_dropout_p(0.1);
         llm.set_training(true);
         let _ = llm.set_sampling_config(0.9, 40, 0.95, 987654321);
 
-        let i_expected: usize = llm.network.iter().map(|l| l.get_parameters_flat().len()).sum();
+        let i_expected: usize = llm
+            .network
+            .iter()
+            .map(|l| l.get_parameters_flat().len())
+            .sum();
         if i_expected != cp.v_params.len() {
             return Err(format!(
                 "checkpoint_param_count_mismatch expected={} got={}",
@@ -2820,12 +3172,8 @@ impl Llm {
         }
 
         llm.assign_all_parameters_flat(&cp.v_params)?;
-        //llm.run_post_load_mtb_diagnostics_ascii();
-        
         Ok(llm)
     }
-
-    
 
     fn sample_next_token_from_logits(&mut self, a_last_logits: &Array2<f32>) -> Result<usize, String> {
         if a_last_logits.nrows() != 1 || a_last_logits.ncols() == 0 {
@@ -2905,9 +3253,14 @@ impl Llm {
             return Err("sampling_weights_invalid".to_string());
         }
 
-        let dist = WeightedIndex::new(&v_weights).map_err(|_| "sampling_weighted_index_error".to_string())?;
+        let dist =
+            WeightedIndex::new(&v_weights).map_err(|_| "sampling_weighted_index_error".to_string())?;
         let i_pick = dist.sample(&mut self.rng_sampling);
-        v_ids.get(i_pick).copied().ok_or_else(|| "sampling_pick_oob".to_string())
+
+        v_ids
+            .get(i_pick)
+            .copied()
+            .ok_or_else(|| "sampling_pick_oob".to_string())
     }
 
     fn forward_generate(&mut self, s_text: &str) -> Result<Vec<usize>, String> {
@@ -2962,7 +3315,9 @@ impl Llm {
             std::mem::replace(&mut self.rng_sampling, StdRng::seed_from_u64(0));
 
         for layer in self.network.iter_mut() {
-            let opt_pg = layer.as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
+            let opt_pg = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
             if let Some(pg) = opt_pg {
                 let i_k = pg.num_branches();
                 let opt_drop: Option<usize> = if i_k == 0 {
@@ -2980,7 +3335,9 @@ impl Llm {
 
     fn clear_predict_outage_for_all_parallel_groups_test_only(&mut self) {
         for layer in self.network.iter_mut() {
-            let opt_pg = layer.as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
+            let opt_pg = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
             if let Some(pg) = opt_pg {
                 pg.set_fault_drop_branch_idx(None);
                 pg.set_fault_injection_enabled(false);
@@ -2988,28 +3345,388 @@ impl Llm {
         }
     }
 
-    // Enable or disable outage simulation (test-only).
     pub fn set_outage_simulation_enabled(&mut self, b_enabled: bool) {
         self.b_outage_simulation_enabled = b_enabled;
         if !b_enabled {
-            // Best effort cleanup: ensure all groups are fully enabled.
             self.clear_predict_outage_for_all_parallel_groups_test_only();
         }
     }
 
-    // Query current outage simulation state.
     pub fn is_outage_simulation_enabled(&self) -> bool {
         self.b_outage_simulation_enabled
     }
 
-    // - 2026-02-04: Ensure predict runs in eval mode and restores training state.
-    // - 2026-02-07: Test only outage injection: drop exactly one branch per ParallelBlockGroup.
+    fn find_first_parallel_block_group_index_ascii(&self) -> Option<usize> {
+        for (i_idx, layer) in self.network.iter().enumerate() {
+            if layer.layer_type() == "ParallelBlockGroup" {
+                return Some(i_idx);
+            }
+        }
+        None
+    }
+
+    pub fn train_two_phase_with_progress_online_ascii(
+        &mut self,
+        v_data_phase1: Vec<&str>,
+        i_epochs_phase1: usize,
+        d_lr_phase1: f32,
+        s_phase1: &str,
+        opt_cl_phase1: Option<ContinuousLearningConfig>,
+        cfg_phase1: phase_strategy_config_ascii,
+        v_data_phase2: Vec<&str>,
+        i_epochs_phase2: usize,
+        d_lr_phase2: f32,
+        s_phase2: &str,
+        opt_cl_phase2: Option<ContinuousLearningConfig>,
+        cfg_phase2: phase_strategy_config_ascii,
+        b_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tx_progress: Sender<TrainingProgressEventAscii>,
+        i_snapshot_every_steps: usize,
+        tx_snapshot: Option<Sender<Vec<f32>>>,
+        rx_data: Receiver<TrainingDataEventAscii>,
+    ) -> Result<(), String> {
+        // History:
+        // - 2026-02-14: Ensure receiver persists across both phases to prevent send failures.
+
+        // Keep receiver alive for entire session; pass as Option to allow shutdown.
+        let mut opt_rx: Option<Receiver<TrainingDataEventAscii>> = Some(rx_data);
+
+        // Phase 1.
+        self.train_with_progress_continuous_learning_online_ascii(
+            v_data_phase1,
+            i_epochs_phase1,
+            d_lr_phase1,
+            std::sync::Arc::clone(&b_cancel),
+            tx_progress.clone(),
+            s_phase1,
+            opt_cl_phase1,
+            i_snapshot_every_steps,
+            tx_snapshot.as_ref().map(|t| t.clone()),
+            cfg_phase1,
+            &mut opt_rx,
+        )?;
+
+        if b_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Phase 2.
+        self.train_with_progress_continuous_learning_online_ascii(
+            v_data_phase2,
+            i_epochs_phase2,
+            d_lr_phase2,
+            std::sync::Arc::clone(&b_cancel),
+            tx_progress,
+            s_phase2,
+            opt_cl_phase2,
+            i_snapshot_every_steps,
+            tx_snapshot,
+            cfg_phase2,
+            &mut opt_rx,
+        )?;
+
+        Ok(())
+    }
+
+
+    pub fn train_with_progress_continuous_learning_online_ascii(
+        &mut self,
+        v_data: Vec<&str>,
+        i_epochs: usize,
+        d_lr: f32,
+        b_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tx_progress: Sender<TrainingProgressEventAscii>,
+        s_phase: &str,
+        opt_cl: Option<ContinuousLearningConfig>,
+        i_snapshot_every_steps: usize,
+        tx_snapshot: Option<Sender<Vec<f32>>>,
+        cfg_phase: phase_strategy_config_ascii,
+        opt_data_rx: &mut Option<Receiver<TrainingDataEventAscii>>,
+    ) -> Result<(), String> {
+        // History:
+        // - 2026-02-14: Online ingestion receiver is borrowed mutably and remains alive across phases.
+
+        cfg_phase.validate()?;
+        self.set_training(true);
+
+        if v_data.is_empty() || i_epochs == 0 {
+            return Err("invalid_training_args".to_string());
+        }
+        if !d_lr.is_finite() || d_lr <= 0.0 {
+            return Err("invalid_learning_rate".to_string());
+        }
+        if s_phase.trim().is_empty() {
+            return Err("invalid_phase".to_string());
+        }
+        if self.bpe_tokenizer.is_none() {
+            return Err("tokenizer_not_set".to_string());
+        }
+
+        // Initial token cache (append-only afterwards).
+        let mut v_tokenized_data: Vec<Vec<usize>> = v_data
+            .iter()
+            .map(|s| self.tokenize(s))
+            .collect::<Result<Vec<Vec<usize>>, String>>()?
+            .into_iter()
+            .filter(|v| v.len() >= 2)
+            .collect();
+
+        if v_tokenized_data.is_empty() {
+            return Err("no_tokenized_rows".to_string());
+        }
+
+        // Ingestion state.
+        let mut st_ing = online_data_ingestion_state_ascii::new_default();
+
+        // Find first ParallelBlockGroup.
+        let mut opt_pg_idx: Option<usize> = None;
+        for (i_idx, layer) in self.network.iter().enumerate() {
+            if layer.layer_type() == "ParallelBlockGroup" {
+                opt_pg_idx = Some(i_idx);
+                break;
+            }
+        }
+
+        let mut rng_mask = rand::rngs::StdRng::seed_from_u64(
+            opt_cl
+                .as_ref()
+                .map(|c| c.u64_mask_seed)
+                .unwrap_or(20260213),
+        );
+
+        // NOTE: These types exist earlier in layer.rs in the same module.
+        let mut st_branch_ema = branch_loss_ema_state_ascii::new(1, 0.2);
+        let mut rb_replay = replay_buffer_ascii::new(
+            if cfg_phase.b_enable_replay { 5000 } else { 0 },
+            20260213,
+        );
+
+        let i_replay_max_steps_per_row: usize = 1;
+
+        let mut i_total_steps: usize = 0;
+        let mut i_skips_empty_act: usize = 0;
+        let mut i_skips_empty_logits: usize = 0;
+        let mut i_skips_pg_downcast_failed: usize = 0;
+        let mut i_skips_pg_no_branches: usize = 0;
+
+        for i_epoch in 0..i_epochs {
+            if b_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+
+            // Drain at epoch boundary to amortize and ensure quick reaction to new data.
+            drain_training_data_events_non_blocking_ascii(
+                self,
+                opt_data_rx,
+                &mut v_tokenized_data,
+                &mut st_ing,
+            );
+
+            let mut d_total_loss_used: f32 = 0.0;
+            let mut i_used_rows: usize = 0;
+            let mut d_last_step_loss: f32 = 0.0;
+
+            // Snapshot length per epoch to avoid shifting iteration windows.
+            let i_epoch_len = v_tokenized_data.len();
+
+            for i_row_idx in 0..i_epoch_len {
+                if b_cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(());
+                }
+
+                // Periodic non-blocking drain for responsiveness.
+                if (i_total_steps % 50) == 0 {
+                    drain_training_data_events_non_blocking_ascii(
+                        self,
+                        opt_data_rx,
+                        &mut v_tokenized_data,
+                        &mut st_ing,
+                    );
+                }
+
+                let v_row = &v_tokenized_data[i_row_idx];
+
+                let b_ema_active = cfg_phase.ema_is_active(i_total_steps);
+                let d_replay_p = cfg_phase.replay_p_at_step(i_total_steps);
+
+                let (b_ok, d_loss) = self.train_one_row_continuous_learning_ascii(
+                    v_row,
+                    d_lr,
+                    opt_pg_idx,
+                    &opt_cl,
+                    &mut rng_mask,
+                    &mut st_branch_ema,
+                    &mut i_skips_empty_act,
+                    &mut i_skips_empty_logits,
+                    &mut i_skips_pg_downcast_failed,
+                    &mut i_skips_pg_no_branches,
+                    b_ema_active,
+                )?;
+
+                if !b_ok {
+                    continue;
+                }
+
+                d_last_step_loss = d_loss;
+                d_total_loss_used += d_loss;
+                i_used_rows = i_used_rows.saturating_add(1);
+                i_total_steps = i_total_steps.saturating_add(1);
+
+                let d_running_epoch_avg_loss: f32 = if i_used_rows == 0 {
+                    0.0
+                } else {
+                    d_total_loss_used / (i_used_rows as f32).max(1.0)
+                };
+
+                // Replay logic remains unchanged.
+                rb_replay.push_row(v_row);
+                if rb_replay.is_enabled() && rb_replay.len() > 0 && d_replay_p > 0.0 {
+                    let d_u: f32 = rng_mask.gen_range(0.0..1.0);
+                    if d_u < d_replay_p {
+                        for _ in 0..i_replay_max_steps_per_row {
+                            if let Some(v_rep) = rb_replay.sample_row() {
+                                let _ = self.train_one_row_continuous_learning_ascii(
+                                    &v_rep,
+                                    d_lr,
+                                    opt_pg_idx,
+                                    &opt_cl,
+                                    &mut rng_mask,
+                                    &mut st_branch_ema,
+                                    &mut i_skips_empty_act,
+                                    &mut i_skips_empty_logits,
+                                    &mut i_skips_pg_downcast_failed,
+                                    &mut i_skips_pg_no_branches,
+                                    b_ema_active,
+                                )?;
+                            }
+                        }
+                    }
+                }
+
+                // Progress event.
+                if (i_total_steps % 25) == 0 {
+                    let mut ev = TrainingProgressEventAscii::new_basic(
+                        s_phase,
+                        i_epoch + 1,
+                        i_epochs,
+                        d_running_epoch_avg_loss,
+                        d_last_step_loss,
+                        0,
+                        i_total_steps,
+                    );
+                    ev.i_skips_empty_act = i_skips_empty_act;
+                    ev.i_skips_empty_logits = i_skips_empty_logits;
+                    ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
+                    ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
+                    let _ = tx_progress.send(ev);
+                }
+
+                // Snapshot update for serving model.
+                if i_snapshot_every_steps > 0 && (i_total_steps % i_snapshot_every_steps) == 0 {
+                    if let Some(tx) = tx_snapshot.as_ref() {
+                        let v_params = self.export_parameters_snapshot();
+                        let _ = tx.send(v_params);
+                    }
+                }
+            }
+
+            // End-of-epoch progress.
+            let d_avg_loss: f32 = if i_used_rows == 0 {
+                0.0
+            } else {
+                d_total_loss_used / (i_used_rows as f32).max(1.0)
+            };
+
+            let mut ev = TrainingProgressEventAscii::new_basic(
+                s_phase,
+                i_epoch + 1,
+                i_epochs,
+                d_avg_loss,
+                d_last_step_loss,
+                i_used_rows,
+                i_total_steps,
+            );
+            ev.i_skips_empty_act = i_skips_empty_act;
+            ev.i_skips_empty_logits = i_skips_empty_logits;
+            ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
+            ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
+            let _ = tx_progress.send(ev);
+        }
+
+        Ok(())
+    }
+
+    fn try_autonomous_expand_first_pg_ascii(
+        &mut self,
+        cfg_phase: &phase_strategy_config_ascii,
+        v_diag_inputs: &[Array2<f32>],
+    ) -> Result<bool, String> {
+        if !cfg_phase.b_enable_autonomous_expansion {
+            return Ok(false);
+        }
+
+        let opt_i_pg = self.find_first_parallel_block_group_index_ascii();
+        let i_pg = match opt_i_pg {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+
+        // Downcast.
+        let pg_num_branches = {
+            let pg = self.network[i_pg]
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+                .ok_or_else(|| "expand_pg_downcast_failed".to_string())?;
+            pg.num_branches()
+        };
+
+        if pg_num_branches >= cfg_phase.i_max_total_branches {
+            return Ok(false);
+        }
+
+        // Compute diagnostics on provided inputs.
+        let m = {
+            let pg = self.network[i_pg]
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+                .ok_or_else(|| "expand_pg_downcast_failed".to_string())?;
+            pg.compute_metrics_from_inputs(v_diag_inputs)?
+        };
+
+        // Simple, conservative trigger rules.
+        let b_starved = m.d_path_starvation_index.is_finite() && m.d_path_starvation_index > 0.60;
+        let b_collapsed = m.d_top1_share.is_finite() && m.d_top1_share > 0.70;
+        let b_low_eff = m.d_effective_num_paths.is_finite() && m.d_effective_num_paths < 2.0;
+
+        if !(b_starved || b_collapsed || b_low_eff) {
+            return Ok(false);
+        }
+
+        // Expand by one new branch (safe default).
+        // In this codebase, branches are TransformerSequence of 2 TransformerBlocks.
+        let b_new_branch: Box<dyn Layer> = {
+            let tb1 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+            let tb2 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
+            let seq = TransformerSequence::new(vec![tb1, tb2])?;
+            Box::new(seq)
+        };
+
+        {
+            let pg = self.network[i_pg]
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+                .ok_or_else(|| "expand_pg_downcast_failed".to_string())?;
+
+            pg.add_branches_with_conservative_injection_ascii(vec![b_new_branch], cfg_phase.d_eta_injection)?;
+        }
+
+        Ok(true)
+    }
+
     pub fn predict(&mut self, s_text: &str) -> Result<String, String> {
         let b_prev = self.b_training;
         self.set_training(false);
 
-
-        // Test-only: simulate outage only if enabled.
         if self.b_outage_simulation_enabled {
             self.set_predict_outage_for_all_parallel_groups_test_only();
         }
@@ -3018,7 +3735,6 @@ impl Llm {
             .forward_generate(s_text)
             .map(|v_out_ids| self.decode_ids(&v_out_ids));
 
-        // Cleanup only if enabled.
         if self.b_outage_simulation_enabled {
             self.clear_predict_outage_for_all_parallel_groups_test_only();
         }
@@ -3027,7 +3743,6 @@ impl Llm {
         r
     }
 
-    // - 2026-02-08: Add forward_generate_with_stats to support prediction metrics reporting.
     fn forward_generate_with_stats(&mut self, s_text: &str) -> Result<(Vec<usize>, PredictStats), String> {
         let mut v_context = self.tokenize(s_text)?;
         let mut v_generated: Vec<usize> = Vec::new();
@@ -3038,7 +3753,6 @@ impl Llm {
 
         let opt_eos = self.vocab.encode(S_EOS);
 
-        // Collect per step stats.
         let mut v_selected_probs: Vec<f32> = Vec::new();
         let mut v_entropies: Vec<f32> = Vec::new();
         let mut v_margins: Vec<f32> = Vec::new();
@@ -3065,7 +3779,6 @@ impl Llm {
                 .to_owned()
                 .insert_axis(Axis(0));
 
-            // Compute distribution for stats (and also for sampling).
             let i_vocab = a_last_logits.ncols();
             if i_vocab == 0 {
                 return Err("sampling_vocab_zero".to_string());
@@ -3087,25 +3800,22 @@ impl Llm {
                 }
             }
 
-            let a_probs = crate::math::softmax_rows(&a_scaled);
+            let a_probs = math::softmax_rows(&a_scaled);
             if a_probs.nrows() != 1 || a_probs.ncols() != i_vocab {
                 return Err("sampling_probs_shape_invalid".to_string());
             }
 
-            // Entropy and top1-top2 margin on full distribution.
             let mut v_p: Vec<f32> = Vec::with_capacity(i_vocab);
             for j in 0..i_vocab {
-                v_p.push(clamp_prob_local(a_probs[[0, j]]));
+                v_p.push(math::clamp_prob_f32(a_probs[[0, j]]));
             }
-            v_entropies.push(entropy_nat_local(&v_p));
-            v_margins.push(top1_top2_margin_local(&v_p));
+            v_entropies.push(math::entropy_nat_f32(&v_p));
+            v_margins.push(math::top1_top2_margin_f32(&v_p));
 
-            // Sample next token using existing method (keeps topk/topp semantics).
             let i_next = self.sample_next_token_from_logits(&a_last_logits)?;
 
-            // Selected token probability from full distribution.
             let d_p_sel = if i_next < i_vocab { a_probs[[0, i_next]] } else { 0.0 };
-            v_selected_probs.push(clamp_prob_local(d_p_sel));
+            v_selected_probs.push(math::clamp_prob_f32(d_p_sel));
 
             v_generated.push(i_next);
             v_context.push(i_next);
@@ -3117,10 +3827,10 @@ impl Llm {
             }
         }
 
-        let d_avg_p_sel = mean_vec_f32_local(&v_selected_probs);
-        let d_ppl = compute_perplexity_from_selected_probs_local(&v_selected_probs);
-        let d_avg_h = mean_vec_f32_local(&v_entropies);
-        let d_avg_margin = mean_vec_f32_local(&v_margins);
+        let d_avg_p_sel = math::mean_vec_f32(&v_selected_probs);
+        let d_ppl = math::perplexity_from_selected_probs_f32(&v_selected_probs);
+        let d_avg_h = math::mean_vec_f32(&v_entropies);
+        let d_avg_margin = math::mean_vec_f32(&v_margins);
 
         let stats = PredictStats {
             d_avg_selected_token_prob: d_avg_p_sel,
@@ -3133,8 +3843,6 @@ impl Llm {
         Ok((v_generated, stats))
     }
 
-    // History:
-    // - 2026-02-08: Add predict_with_stats for post predict metrics in main.rs.
     pub fn predict_with_stats(&mut self, s_text: &str) -> Result<(String, PredictStats), String> {
         let b_prev = self.b_training;
         self.set_training(false);
@@ -3156,7 +3864,6 @@ impl Llm {
         r
     }
 
-
     pub fn export_parameters_snapshot(&self) -> Vec<f32> {
         // History:
         // - 2026-02-13: Add snapshot export to update serving model without blocking training.
@@ -3169,11 +3876,7 @@ impl Llm {
         self.assign_all_parameters_flat(v_params)
     }
 
-    fn sample_availability_mask(
-        rng: &mut StdRng,
-        v_p: &[f32],
-        i_min_active: usize,
-    ) -> Vec<bool> {
+    fn sample_availability_mask(rng: &mut StdRng, v_p: &[f32], i_min_active: usize) -> Vec<bool> {
         let i_k = v_p.len();
         if i_k == 0 {
             return Vec::new();
@@ -3184,14 +3887,13 @@ impl Llm {
 
         for i in 0..i_k {
             let d_u: f32 = rng.gen_range(0.0..1.0);
-            let d_p = v_p[i].clamp(0.0, 1.0);
-            if d_u < d_p {
+            let d_pp = v_p[i].clamp(0.0, 1.0);
+            if d_u < d_pp {
                 v_mask[i] = true;
                 i_active = i_active.saturating_add(1);
             }
         }
 
-        // Enforce minimum participation by activating random inactive branches.
         if i_active < i_min_active {
             let mut v_inactive: Vec<usize> = Vec::new();
             for i in 0..i_k {
@@ -3211,316 +3913,570 @@ impl Llm {
         v_mask
     }
 
-    pub fn train_with_progress_continuous_learning_ascii(
+    fn forward_from_layer_index_ascii(
         &mut self,
-        v_data: Vec<&str>,
-        i_epochs: usize,
-        d_lr: f32,
-        b_cancel: Arc<AtomicBool>,
-        tx_progress: Sender<TrainingProgressEventAscii>,
-        s_phase: &str,
-        opt_cl: Option<ContinuousLearningConfig>,
-        i_snapshot_every_steps: usize,
-        tx_snapshot: Option<Sender<Vec<f32>>>,
-    ) -> Result<(), String> {
-        // History:
-        // - 2026-02-13: Fix epoch aggregation and counters; add skip diagnostics.
-        self.set_training(true);
-
-        if v_data.is_empty() || i_epochs == 0 {
-            return Err("invalid_training_args".to_string());
+        i_start_layer: usize,
+        a_input: &Array2<f32>,
+    ) -> Result<Array2<f32>, String> {
+        if i_start_layer >= self.network.len() {
+            return Err("forward_from_layer_index_start_oob".to_string());
         }
-        if !d_lr.is_finite() || d_lr <= 0.0 {
-            return Err("invalid_learning_rate".to_string());
-        }
-        if self.bpe_tokenizer.is_none() {
-            return Err("tokenizer_not_set".to_string());
+        if a_input.nrows() == 0 || a_input.ncols() == 0 {
+            return Err("forward_from_layer_index_empty_input".to_string());
         }
 
-        let v_tokenized_data: Vec<Vec<usize>> = v_data
-            .iter()
-            .map(|s| self.tokenize(s))
-            .collect::<Result<Vec<_>, String>>()?
-            .into_iter()
-            .filter(|v| v.len() >= 2)
-            .collect();
-
-        if v_tokenized_data.is_empty() {
-            return Err("no_tokenized_rows".to_string());
-        }
-
-        // Locate first ParallelBlockGroup.
-        let mut opt_pg_idx: Option<usize> = None;
-        for (i_idx, layer) in self.network.iter().enumerate() {
-            if layer.layer_type() == "ParallelBlockGroup" {
-                opt_pg_idx = Some(i_idx);
-                break;
+        let mut a_act = a_input.clone();
+        for i_l in i_start_layer..self.network.len() {
+            a_act = self.network[i_l].forward(&a_act);
+            if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                return Err("forward_from_layer_index_empty_act".to_string());
             }
         }
 
-        let mut rng_mask = StdRng::seed_from_u64(
-            opt_cl
-                .as_ref()
-                .map(|c| c.u64_mask_seed)
-                .unwrap_or(20260213),
-        );
+        Ok(a_act)
+    }
 
-        let mut i_total_steps: usize = 0;
+    fn make_single_branch_mask_ascii(i_k: usize, i_branch: usize) -> Vec<bool> {
+        let mut v = vec![false; i_k];
+        if i_branch < i_k {
+            v[i_branch] = true;
+        }
+        v
+    }
 
-        // Global diagnostics (across epochs).
-        let mut i_skips_empty_act: usize = 0;
-        let mut i_skips_empty_logits: usize = 0;
-        let mut i_skips_pg_downcast_failed: usize = 0;
-        let mut i_skips_pg_no_branches: usize = 0;
+    fn evaluate_branch_loss_one_example_ascii(
+        &mut self,
+        i_pg: usize,
+        a_act_before_pg: &Array2<f32>,
+        v_target_ids: &[usize],
+        v_mask_single_branch: &[bool],
+    ) -> Result<f32, String> {
+        if i_pg >= self.network.len() {
+            return Err("eval_branch_loss_pg_oob".to_string());
+        }
+        if a_act_before_pg.nrows() == 0 || a_act_before_pg.ncols() == 0 {
+            return Err("eval_branch_loss_empty_pre_pg_act".to_string());
+        }
+        if v_target_ids.is_empty() {
+            return Err("eval_branch_loss_empty_targets".to_string());
+        }
 
-        for i_epoch in 0..i_epochs {
+        let a_after_pg = {
+            let pg = self.network[i_pg]
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+                .ok_or_else(|| "eval_branch_loss_pg_downcast_failed".to_string())?;
+            pg.forward_with_availability_mask(a_act_before_pg, v_mask_single_branch)
+        };
+
+        if a_after_pg.nrows() == 0 || a_after_pg.ncols() == 0 {
+            return Err("eval_branch_loss_empty_post_pg_act".to_string());
+        }
+
+        let a_logits = self.forward_from_layer_index_ascii(i_pg + 1, &a_after_pg)?;
+        if a_logits.nrows() == 0 || a_logits.ncols() == 0 {
+            return Err("eval_branch_loss_empty_logits".to_string());
+        }
+
+        let a_probs = math::softmax_rows(&a_logits);
+        let d_loss = math::cross_entropy_loss_step(&a_probs, v_target_ids);
+
+        if !d_loss.is_finite() {
+            return Err("eval_branch_loss_non_finite".to_string());
+        }
+
+        Ok(d_loss)
+    }
+
+    fn select_branch_min_ema_loss_ascii(
+        &mut self,
+        st_ema: &mut branch_loss_ema_state_ascii,
+        i_pg: usize,
+        a_act_before_pg: &Array2<f32>,
+        v_target_ids: &[usize],
+        v_available_mask: &[bool],
+    ) -> Result<usize, String> {
+        let i_k = v_available_mask.len();
+        if i_k == 0 {
+            return Err("select_branch_no_branches".to_string());
+        }
+        st_ema.ensure_len(i_k);
+
+        for i_b in 0..i_k {
+            if !v_available_mask[i_b] {
+                continue;
+            }
+            let v_single = Self::make_single_branch_mask_ascii(i_k, i_b);
+            let d_loss = match self.evaluate_branch_loss_one_example_ascii(
+                i_pg,
+                a_act_before_pg,
+                v_target_ids,
+                &v_single,
+            ) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            st_ema.update_ema(i_b, d_loss);
+        }
+
+        let mut opt_best: Option<usize> = None;
+        let mut d_best: f32 = f32::INFINITY;
+
+        for i_b in 0..i_k {
+            if !v_available_mask[i_b] {
+                continue;
+            }
+            let d_score = st_ema.get_score_or_fallback(i_b, 1.0e9);
+            if d_score < d_best {
+                d_best = d_score;
+                opt_best = Some(i_b);
+            }
+        }
+
+        let i_sel = opt_best.ok_or_else(|| "select_branch_no_valid_candidate".to_string())?;
+        st_ema.opt_last_selected_branch = Some(i_sel);
+        Ok(i_sel)
+    }
+
+    fn train_one_row_continuous_learning_ascii(
+        &mut self,
+        v_row: &[usize],
+        d_lr: f32,
+        opt_pg_idx: Option<usize>,
+        opt_cl: &Option<ContinuousLearningConfig>,
+        rng_mask: &mut StdRng,
+        st_branch_ema: &mut branch_loss_ema_state_ascii,
+        // Diagnostics counters (shared with outer loop).
+        i_skips_empty_act: &mut usize,
+        i_skips_empty_logits: &mut usize,
+        i_skips_pg_downcast_failed: &mut usize,
+        i_skips_pg_no_branches: &mut usize,
+        b_enable_ema_selection: bool,
+    ) -> Result<(bool, f32), String> {
+        if v_row.len() < 2 {
+            return Ok((false, 0.0));
+        }
+
+        let v_input_ids = &v_row[..v_row.len() - 1];
+        let v_target_ids = &v_row[1..];
+
+        let mut a_input: Array2<f32> = Array2::zeros((1, v_input_ids.len()));
+        let a_row = Array1::from_iter(v_input_ids.iter().map(|&x| x as f32));
+        a_input.row_mut(0).assign(&a_row);
+
+        let mut b_update_applied: bool = false;
+        let mut d_step_loss: f32 = 0.0;
+
+        if let Some(i_pg) = opt_pg_idx {
+            // Forward prefix up to PG.
+            let mut a_act = a_input;
+            for i_l in 0..i_pg {
+                a_act = self.network[i_l].forward(&a_act);
+                if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                    *i_skips_empty_act = i_skips_empty_act.saturating_add(1);
+                    return Ok((false, 0.0));
+                }
+            }
+
+            // Branch count.
+            let i_k = match self.network[i_pg]
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+            {
+                Some(pg) => pg.num_branches(),
+                None => {
+                    *i_skips_pg_downcast_failed = i_skips_pg_downcast_failed.saturating_add(1);
+                    return Ok((false, 0.0));
+                }
+            };
+
+            if i_k == 0 {
+                *i_skips_pg_no_branches = i_skips_pg_no_branches.saturating_add(1);
+                return Ok((false, 0.0));
+            }
+
+            let cl_cfg = opt_cl.clone().unwrap_or_else(|| {
+                ContinuousLearningConfig::new_default_for_num_branches(i_k)
+            });
+            cl_cfg.validate(i_k)?;
+
+            // Availability mask.
+            let v_available_mask = Self::sample_availability_mask(
+                rng_mask,
+                &cl_cfg.v_branch_participation_p,
+                cl_cfg.i_min_active_branches,
+            );
+
+            if v_available_mask.len() != i_k {
+                *i_skips_pg_no_branches = i_skips_pg_no_branches.saturating_add(1);
+                return Ok((false, 0.0));
+            }
+
+            // EMA based selection within available set.
+            let i_best_branch = if b_enable_ema_selection {
+                match self.select_branch_min_ema_loss_ascii(
+                    st_branch_ema,
+                    i_pg,
+                    &a_act,
+                    v_target_ids,
+                    &v_available_mask,
+                ) {
+                    Ok(i) => i,
+                    Err(_) => usize::MAX,
+                }
+            } else {
+                usize::MAX
+            };
+
+            let v_train_mask: Vec<bool> = if i_best_branch != usize::MAX && i_best_branch < i_k {
+                Self::make_single_branch_mask_ascii(i_k, i_best_branch)
+            } else {
+                v_available_mask.clone()
+            };
+
+            let opt_scales: Option<Vec<f32>> = if cl_cfg.b_scale_by_inverse_participation {
+                Some(
+                    cl_cfg
+                        .v_branch_participation_p
+                        .iter()
+                        .map(|&p| {
+                            let d_inv = 1.0 / p.max(1e-6);
+                            d_inv.clamp(1.0, 5.0)
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
+            // Forward PG with mask.
+            {
+                let pg = self.network[i_pg]
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+                    .ok_or_else(|| "pg_downcast_failed".to_string())?;
+
+                a_act = pg.forward_with_availability_mask(&a_act, &v_train_mask);
+            }
+
+            if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                *i_skips_empty_act = i_skips_empty_act.saturating_add(1);
+                return Ok((false, 0.0));
+            }
+
+            // Forward tail.
+            for i_l in (i_pg + 1)..self.network.len() {
+                a_act = self.network[i_l].forward(&a_act);
+                if a_act.nrows() == 0 || a_act.ncols() == 0 {
+                    *i_skips_empty_act = i_skips_empty_act.saturating_add(1);
+                    return Ok((false, 0.0));
+                }
+            }
+
+            let a_logits = a_act;
+            if a_logits.nrows() == 0 || a_logits.ncols() == 0 {
+                *i_skips_empty_logits = i_skips_empty_logits.saturating_add(1);
+                return Ok((false, 0.0));
+            }
+
+            // Loss and backward.
+            let a_probs = math::softmax_rows(&a_logits);
+            d_step_loss = math::cross_entropy_loss_step(&a_probs, v_target_ids);
+
+            let mut a_grads = math::compute_gradients_step(&a_probs, v_target_ids);
+            math::clip_gradients_global_norm(&mut a_grads, 5.0);
+
+            for i_l in (i_pg + 1..self.network.len()).rev() {
+                a_grads = self.network[i_l].backward(&a_grads, d_lr);
+            }
+
+            {
+                let pg = self.network[i_pg]
+                    .as_any_mut()
+                    .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
+                    .ok_or_else(|| "pg_downcast_failed".to_string())?;
+
+                a_grads = pg.backward_with_availability_mask(
+                    &a_grads,
+                    d_lr,
+                    &v_train_mask,
+                    opt_scales.as_deref(),
+                );
+            }
+
+            for i_l in (0..i_pg).rev() {
+                a_grads = self.network[i_l].backward(&a_grads, d_lr);
+            }
+
+            b_update_applied = true;
+        } else {
+            // Fallback: full participation.
+            let mut a_act = a_input;
+            for layer in self.network.iter_mut() {
+                a_act = layer.forward(&a_act);
+            }
+
+            let a_logits = a_act;
+            if a_logits.nrows() == 0 || a_logits.ncols() == 0 {
+                *i_skips_empty_logits = i_skips_empty_logits.saturating_add(1);
+                return Ok((false, 0.0));
+            }
+
+            let a_probs = math::softmax_rows(&a_logits);
+            d_step_loss = math::cross_entropy_loss_step(&a_probs, v_target_ids);
+
+            let mut a_grads = math::compute_gradients_step(&a_probs, v_target_ids);
+            math::clip_gradients_global_norm(&mut a_grads, 5.0);
+
+            for layer in self.network.iter_mut().rev() {
+                a_grads = layer.backward(&a_grads, d_lr);
+            }
+
+            b_update_applied = true;
+        }
+
+        Ok((b_update_applied, d_step_loss))
+    }
+
+
+
+// layer.rs
+// Description: Patch - Integrate phase strategy and autonomous expansion into training loop.
+// History:
+// - 2026-02-14: Add phase oriented strategy with ramp up and autonomous expansion checks.
+// Author: Marcus Schlieper
+
+pub fn train_with_progress_continuous_learning_ascii(
+    &mut self,
+    v_data: Vec<&str>,
+    i_epochs: usize,
+    d_lr: f32,
+    b_cancel: Arc<AtomicBool>,
+    tx_progress: Sender<TrainingProgressEventAscii>,
+    s_phase: &str,
+    opt_cl: Option<ContinuousLearningConfig>,
+    i_snapshot_every_steps: usize,
+    tx_snapshot: Option<Sender<Vec<f32>>>,
+    cfg_phase: phase_strategy_config_ascii,
+) -> Result<(), String> {
+    // History:
+    // - 2026-02-13: Add EMA stabilized branch selection and experience replay.
+    // - 2026-02-14: Phase oriented strategy with replay ramp up and autonomous expansion.
+
+    cfg_phase.validate()?;
+    self.set_training(true);
+
+    if v_data.is_empty() || i_epochs == 0 {
+        return Err("invalid_training_args".to_string());
+    }
+    if !d_lr.is_finite() || d_lr <= 0.0 {
+        return Err("invalid_learning_rate".to_string());
+    }
+    if s_phase.trim().is_empty() {
+        return Err("invalid_phase".to_string());
+    }
+    if self.bpe_tokenizer.is_none() {
+        return Err("tokenizer_not_set".to_string());
+    }
+
+    let v_tokenized_data: Vec<Vec<usize>> = v_data
+        .iter()
+        .map(|s| self.tokenize(s))
+        .collect::<Result<Vec<Vec<usize>>, String>>()?
+        .into_iter()
+        .filter(|v| v.len() >= 2)
+        .collect();
+
+    if v_tokenized_data.is_empty() {
+        return Err("no_tokenized_rows".to_string());
+    }
+
+    let mut opt_pg_idx: Option<usize> = None;
+    for (i_idx, layer) in self.network.iter().enumerate() {
+        if layer.layer_type() == "ParallelBlockGroup" {
+            opt_pg_idx = Some(i_idx);
+            break;
+        }
+    }
+
+    let mut rng_mask = StdRng::seed_from_u64(
+        opt_cl
+            .as_ref()
+            .map(|c| c.u64_mask_seed)
+            .unwrap_or(20260213),
+    );
+
+    let mut st_branch_ema = branch_loss_ema_state_ascii::new(1, 0.2);
+
+    // Replay buffer is enabled by cfg_phase, but probability is ramped up.
+    let mut rb_replay = replay_buffer_ascii::new(if cfg_phase.b_enable_replay { 5000 } else { 0 }, 20260213);
+    let i_replay_max_steps_per_row: usize = 1;
+
+    let mut i_total_steps: usize = 0;
+
+    let mut i_skips_empty_act: usize = 0;
+    let mut i_skips_empty_logits: usize = 0;
+    let mut i_skips_pg_downcast_failed: usize = 0;
+    let mut i_skips_pg_no_branches: usize = 0;
+
+    for i_epoch in 0..i_epochs {
+        if b_cancel.load(AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+
+        let mut d_total_loss_used: f32 = 0.0;
+        let mut i_used_rows: usize = 0;
+        let mut d_last_step_loss: f32 = 0.0;
+
+        for v_row in v_tokenized_data.iter() {
             if b_cancel.load(AtomicOrdering::SeqCst) {
                 return Ok(());
             }
 
-            let mut d_total_loss_used: f32 = 0.0;
-            let mut i_used_rows: usize = 0;
-            let mut d_last_step_loss: f32 = 0.0;
+            // Phase dependent toggles.
+            let b_ema_active = cfg_phase.ema_is_active(i_total_steps);
+            let d_replay_p = cfg_phase.replay_p_at_step(i_total_steps);
 
-            for v_row in v_tokenized_data.iter() {
-                if b_cancel.load(AtomicOrdering::SeqCst) {
-                    return Ok(());
-                }
+            // NOTE:
+            // The current code uses select_branch_min_ema_loss_ascii inside train_one_row_continuous_learning_ascii.
+            // For strict phase control, that function must receive a boolean to bypass EMA selection
+            // and default to v_available_mask (no selective routing) while EMA is inactive.
 
-                let v_input_ids = &v_row[..v_row.len() - 1];
-                let v_target_ids = &v_row[1..];
+            let (b_ok, d_loss) = self.train_one_row_continuous_learning_ascii(
+                v_row,
+                d_lr,
+                opt_pg_idx,
+                &opt_cl,
+                &mut rng_mask,
+                &mut st_branch_ema,
+                &mut i_skips_empty_act,
+                &mut i_skips_empty_logits,
+                &mut i_skips_pg_downcast_failed,
+                &mut i_skips_pg_no_branches,
+                b_ema_active,
+            )?;
 
-                // Build input.
-                let mut a_input: Array2<f32> = Array2::zeros((1, v_input_ids.len()));
-                let a_row = Array1::from_iter(v_input_ids.iter().map(|&x| x as f32));
-                a_input.row_mut(0).assign(&a_row);
-
-                let mut b_update_applied: bool = false;
-
-                if let Some(i_pg) = opt_pg_idx {
-                    // Forward up to PG.
-                    let mut a_act = a_input;
-                    for i_l in 0..i_pg {
-                        a_act = self.network[i_l].forward(&a_act);
-                        if a_act.nrows() == 0 || a_act.ncols() == 0 {
-                            i_skips_empty_act = i_skips_empty_act.saturating_add(1);
-                            a_act = Array2::zeros((0, 0));
-                            break;
-                        }
-                    }
-                    if a_act.nrows() == 0 || a_act.ncols() == 0 {
-                        continue;
-                    }
-
-                    // Determine branches.
-                    let i_k = match self.network[i_pg]
-                        .as_any_mut()
-                        .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
-                    {
-                        Some(pg) => pg.num_branches(),
-                        None => {
-                            i_skips_pg_downcast_failed = i_skips_pg_downcast_failed.saturating_add(1);
-                            continue;
-                        }
-                    };
-                    if i_k == 0 {
-                        i_skips_pg_no_branches = i_skips_pg_no_branches.saturating_add(1);
-                        continue;
-                    }
-
-                    let cl_cfg = opt_cl.clone().unwrap_or_else(|| {
-                        ContinuousLearningConfig::new_default_for_num_branches(i_k)
-                    });
-                    cl_cfg.validate(i_k)?;
-
-                    // Sample mask; guarantee min participation is met by implementation.
-                    let v_mask = Self::sample_availability_mask(
-                        &mut rng_mask,
-                        &cl_cfg.v_branch_participation_p,
-                        cl_cfg.i_min_active_branches,
-                    );
-
-                    // Forward PG with mask.
-                    {
-                        let pg = self.network[i_pg]
-                            .as_any_mut()
-                            .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
-                            .ok_or_else(|| "pg_downcast_failed".to_string())?;
-                        a_act = pg.forward_with_availability_mask(&a_act, &v_mask);
-                    }
-                    if a_act.nrows() == 0 || a_act.ncols() == 0 {
-                        i_skips_empty_act = i_skips_empty_act.saturating_add(1);
-                        continue;
-                    }
-
-                    // Forward after PG.
-                    for i_l in (i_pg + 1)..self.network.len() {
-                        a_act = self.network[i_l].forward(&a_act);
-                        if a_act.nrows() == 0 || a_act.ncols() == 0 {
-                            i_skips_empty_act = i_skips_empty_act.saturating_add(1);
-                            a_act = Array2::zeros((0, 0));
-                            break;
-                        }
-                    }
-                    if a_act.nrows() == 0 || a_act.ncols() == 0 {
-                        continue;
-                    }
-
-                    // Logits.
-                    let a_logits = a_act;
-                    if a_logits.nrows() == 0 || a_logits.ncols() == 0 {
-                        i_skips_empty_logits = i_skips_empty_logits.saturating_add(1);
-                        continue;
-                    }
-
-                    // Loss.
-                    let a_probs = math::softmax_rows(&a_logits);
-                    let d_step_loss = math::cross_entropy_loss_step(&a_probs, v_target_ids);
-                    d_last_step_loss = d_step_loss;
-
-                    // Backward.
-                    let mut a_grads = math::compute_gradients_step(&a_probs, v_target_ids);
-                    math::clip_gradients_global_norm(&mut a_grads, 5.0);
-
-                    // Backward after PG.
-                    for i_l in (i_pg + 1..self.network.len()).rev() {
-                        a_grads = self.network[i_l].backward(&a_grads, d_lr);
-                    }
-
-                    // 1/p scaling (capped to reduce variance blow-up).
-                    let opt_scales: Option<Vec<f32>> = if cl_cfg.b_scale_by_inverse_participation {
-                        Some(
-                            cl_cfg
-                                .v_branch_participation_p
-                                .iter()
-                                .map(|&p| {
-                                    let d_inv = 1.0 / p.max(1e-6);
-                                    // Conservative cap to limit instability for small p.
-                                    d_inv.clamp(1.0, 5.0)
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        None
-                    };
-
-                    // Backward PG with mask and optional scaling.
-                    {
-                        let pg = self.network[i_pg]
-                            .as_any_mut()
-                            .and_then(|a| a.downcast_mut::<ParallelBlockGroup>())
-                            .ok_or_else(|| "pg_downcast_failed".to_string())?;
-                        a_grads = pg.backward_with_availability_mask(
-                            &a_grads,
-                            d_lr,
-                            &v_mask,
-                            opt_scales.as_deref(),
-                        );
-                    }
-
-                    // Backward before PG.
-                    for i_l in (0..i_pg).rev() {
-                        a_grads = self.network[i_l].backward(&a_grads, d_lr);
-                    }
-
-                    // At this point, the update is considered applied.
-                    b_update_applied = true;
-                } else {
-                    // Fallback: full participation training.
-                    let mut a_act = a_input;
-                    for layer in self.network.iter_mut() {
-                        a_act = layer.forward(&a_act);
-                    }
-
-                    let a_logits = a_act;
-                    if a_logits.nrows() == 0 || a_logits.ncols() == 0 {
-                        i_skips_empty_logits = i_skips_empty_logits.saturating_add(1);
-                        continue;
-                    }
-
-                    let a_probs = math::softmax_rows(&a_logits);
-                    let d_step_loss = math::cross_entropy_loss_step(&a_probs, v_target_ids);
-                    d_last_step_loss = d_step_loss;
-
-                    let mut a_grads = math::compute_gradients_step(&a_probs, v_target_ids);
-                    math::clip_gradients_global_norm(&mut a_grads, 5.0);
-
-                    for layer in self.network.iter_mut().rev() {
-                        a_grads = layer.backward(&a_grads, d_lr);
-                    }
-
-                    b_update_applied = true;
-                }
-
-                if b_update_applied {
-                    i_used_rows = i_used_rows.saturating_add(1);
-                    i_total_steps = i_total_steps.saturating_add(1);
-                    d_total_loss_used += d_last_step_loss;
-
-                    // Step progress (throttled).
-                    if (i_total_steps % 25) == 0 {
-                        let mut ev = TrainingProgressEventAscii::new_basic(
-                            s_phase,
-                            i_epoch + 1,
-                            i_epochs,
-                            0.0,
-                            d_last_step_loss,
-                            0,
-                            i_total_steps,
-                        );
-                        ev.i_skips_empty_act = i_skips_empty_act;
-                        ev.i_skips_empty_logits = i_skips_empty_logits;
-                        ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
-                        ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
-                        let _ = tx_progress.send(ev);
-                    }
-
-                    // Snapshot update for serving.
-                    if i_snapshot_every_steps > 0 && (i_total_steps % i_snapshot_every_steps) == 0 {
-                        if let Some(tx) = tx_snapshot.as_ref() {
-                            let v_params = self.export_parameters_snapshot();
-                            let _ = tx.send(v_params);
-                        }
-                    }
-                }
+            if !b_ok {
+                continue;
             }
 
-            // Epoch loss over used rows only.
-            let d_avg_loss = if i_used_rows == 0 {
+            d_last_step_loss = d_loss;
+            d_total_loss_used += d_loss;
+            i_used_rows = i_used_rows.saturating_add(1);
+            i_total_steps = i_total_steps.saturating_add(1);
+
+            let d_running_epoch_avg_loss: f32 = if i_used_rows == 0 {
                 0.0
             } else {
                 d_total_loss_used / (i_used_rows as f32).max(1.0)
             };
 
-            let mut ev = TrainingProgressEventAscii::new_basic(
-                s_phase,
-                i_epoch + 1,
-                i_epochs,
-                d_avg_loss,
-                d_last_step_loss,
-                i_used_rows,
-                i_total_steps,
-            );
-            ev.i_skips_empty_act = i_skips_empty_act;
-            ev.i_skips_empty_logits = i_skips_empty_logits;
-            ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
-            ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
-            let _ = tx_progress.send(ev);
+            // Replay update and optional replay steps.
+            rb_replay.push_row(v_row);
+            if rb_replay.is_enabled() && rb_replay.len() > 0 && d_replay_p > 0.0 {
+                let d_u: f32 = rng_mask.gen_range(0.0..1.0);
+                if d_u < d_replay_p {
+                    for _ in 0..i_replay_max_steps_per_row {
+                        if let Some(v_rep) = rb_replay.sample_row() {
+                            let _ = self.train_one_row_continuous_learning_ascii(
+                                &v_rep,
+                                d_lr,
+                                opt_pg_idx,
+                                &opt_cl,
+                                &mut rng_mask,
+                                &mut st_branch_ema,
+                                &mut i_skips_empty_act,
+                                &mut i_skips_empty_logits,
+                                &mut i_skips_pg_downcast_failed,
+                                &mut i_skips_pg_no_branches,
+                                b_ema_active,
+                            )?;
+                        }
+                    }
+                }
+            }
 
-            /*
-            println!(
-                "Epoch {} ({}) : used_rows={} loss={:.6} steps_total={}",
-                i_epoch + 1,
-                s_phase,
-                i_used_rows,
-                d_avg_loss,
-                i_total_steps
-            );*/
+            // Autonomous expansion check at fixed interval.
+            if cfg_phase.b_enable_autonomous_expansion
+                && cfg_phase.i_expand_check_every_steps > 0
+                && (i_total_steps % cfg_phase.i_expand_check_every_steps) == 0
+            {
+                // Diagnostics inputs: reuse a small slice of already tokenized stream.
+                // Build activations before PG using existing helper if available; otherwise use
+                // collect_parallel_block_group_inputs_for_diagnostics with fixed prompts.
+                let v_prompts: Vec<String> = vec![
+                    "User: diagnostic prompt 1".to_string(),
+                    "User: diagnostic prompt 2".to_string(),
+                    "User: diagnostic prompt 3".to_string(),
+                    "User: diagnostic prompt 4".to_string(),
+                ];
+
+                let v_diag_inputs = self
+                    .collect_parallel_block_group_inputs_for_diagnostics(&v_prompts, 4)
+                    .unwrap_or_else(|_| Vec::new());
+
+                if !v_diag_inputs.is_empty() {
+                    let _ = self.try_autonomous_expand_first_pg_ascii(&cfg_phase, &v_diag_inputs);
+                }
+            }
+
+            // Progress event.
+            if (i_total_steps % 25) == 0 {
+                let mut ev = TrainingProgressEventAscii::new_basic(
+                    s_phase,
+                    i_epoch + 1,
+                    i_epochs,
+                    d_running_epoch_avg_loss,
+                    d_last_step_loss,
+                    0,
+                    i_total_steps,
+                );
+                ev.i_skips_empty_act = i_skips_empty_act;
+                ev.i_skips_empty_logits = i_skips_empty_logits;
+                ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
+                ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
+                let _ = tx_progress.send(ev);
+            }
+
+            // Snapshot export for serving updates.
+            if i_snapshot_every_steps > 0 && (i_total_steps % i_snapshot_every_steps) == 0 {
+                if let Some(tx) = tx_snapshot.as_ref() {
+                    let v_params = self.export_parameters_snapshot();
+                    let _ = tx.send(v_params);
+                }
+            }
+
+            // b_ema_active is currently not wired into train_one_row_continuous_learning_ascii.
+            // This is intentionally not ignored: the bypass must be implemented next.
+            let _ = b_ema_active;
         }
 
-        Ok(())
+        let d_avg_loss: f32 = if i_used_rows == 0 {
+            0.0
+        } else {
+            d_total_loss_used / (i_used_rows as f32).max(1.0)
+        };
+
+        let mut ev = TrainingProgressEventAscii::new_basic(
+            s_phase,
+            i_epoch + 1,
+            i_epochs,
+            d_avg_loss,
+            d_last_step_loss,
+            i_used_rows,
+            i_total_steps,
+        );
+        ev.i_skips_empty_act = i_skips_empty_act;
+        ev.i_skips_empty_logits = i_skips_empty_logits;
+        ev.i_skips_pg_downcast_failed = i_skips_pg_downcast_failed;
+        ev.i_skips_pg_no_branches = i_skips_pg_no_branches;
+        let _ = tx_progress.send(ev);
     }
-    
+
+    Ok(())
+}
+
+
 
     pub fn train(&mut self, v_data: Vec<&str>, i_epochs: usize, d_lr: f32) -> Result<(), String> {
         self.set_training(true);
@@ -3581,7 +4537,7 @@ impl Llm {
                     a_grads = layer.backward(&a_grads, d_lr);
                 }
 
-                i_used_rows += 1;
+                i_used_rows = i_used_rows.saturating_add(1);
             }
 
             let d_avg_loss = if i_used_rows == 0 {
@@ -3657,8 +4613,6 @@ impl Llm {
         Ok(v_inputs)
     }
 
-    // History:
-    // - 2026-02-07: Add post load MTB diagnostics metrics computation.
     pub fn run_post_load_mtb_diagnostics_ascii(&mut self) {
         let b_prev = self.b_training;
         self.set_training(false);
@@ -3684,11 +4638,14 @@ impl Llm {
         };
 
         for layer in self.network.iter_mut() {
-            let opt_pg = layer.as_any_mut().and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
+            let opt_pg = layer
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<ParallelBlockGroup>());
             if opt_pg.is_none() {
                 continue;
             }
             let pg = opt_pg.unwrap();
+
             match pg.compute_metrics_from_inputs(&v_inputs) {
                 Ok(m) => {
                     for s_line in m.to_ascii_report_lines() {
@@ -3704,3 +4661,4 @@ impl Llm {
         self.set_training(b_prev);
     }
 }
+

@@ -7,7 +7,7 @@
 // - 2026-02-01: Add JSON checkpoint helpers and atomic write for save and load.
 // - 2026-02-08: Add UTF-8 safe normalization helpers (spacing and NFC normalization).
 // Author: Marcus Schlieper
-
+#![allow(warnings)]
 use crate::layer::Vocab;
 
 // UTF-8 safe check for tokens like "<...>".

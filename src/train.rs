@@ -3,7 +3,7 @@
 // History:
 // - 2026-02-01: Consolidate dataset loader into train.rs.
 // Author: Marcus Schlieper
-
+#![allow(warnings)]
 use std::fs;
 
 use csv::ReaderBuilder;

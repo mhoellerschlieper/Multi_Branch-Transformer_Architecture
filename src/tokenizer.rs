@@ -13,6 +13,7 @@
 // - 2026-02-01: Implement stable special tokens, improved pre-tokenization, and deterministic training.
 // - 2026-02-08: Implement UTF-8 aware pre-tokenization and decoding normalization.
 // Author: Marcus Schlieper
+#![allow(warnings)]
 
 use std::collections::{HashMap, HashSet};
 

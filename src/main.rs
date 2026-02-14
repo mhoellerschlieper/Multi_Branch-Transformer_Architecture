@@ -1,20 +1,25 @@
 // main.rs
-// Description: Binary entry point with menu loop. Builds model from tokenizer,
-//              supports checkpoint save and load.
+// Description: Binary entry point with interactive menu loop.
+//              Builds model from tokenizer, supports checkpoint save and load, and provides
+//              parallel training and serving via separate model instances.
 //
-//              Extension:
+//              Extensions:
 //              - Background training thread with live metrics
-//              - Parallel "ask" during training via separate serving model instance
-//              - Continuous learning: partial path availability and incremental updates
+//              - Parallel ask during training via separate serving model instance
+//              - Snapshot based parameter hot updates from training to serving
+//              - Continuous learning support for partial path availability and incremental updates
+//              - Online data ingestion: add training data files while training is running
 //
 // History:
 // - 2026-02-01: Add menu loop and checkpoint save and load.
-// - 2026-02-07: Add MTB parallel block group layer to support multi branch topology.
+// - 2026-02-07: Add MBT parallel block group layer to support multi branch topology.
 // - 2026-02-08: Add predict_with_stats and post predict metrics.
-// - 2026-02-08: Add command z to compute mean metrics with outage simulation off and on.
 // - 2026-02-13: Add background training, live metrics, cooperative stop.
 // - 2026-02-13: Add serving model with snapshot updates for true parallel ask during training.
-// Author: Marcus Schlieper
+// - 2026-02-14: Add online ingestion channel and robust menu wiring for command b.
+// Author: Marcus Schlieper (ExpChat.ai)
+
+#![allow(warnings)]
 
 mod layer;
 mod math;
@@ -29,8 +34,9 @@ use std::thread;
 use std::time::Instant;
 
 use crate::layer::{
-    ContinuousLearningConfig, Embeddings, Layer, Llm, OutputProjection, ParallelBlockGroup, PredictStats,
-    TrainingProgressEventAscii, TransformerBlock, TransformerSequence,
+    ContinuousLearningConfig, Embeddings, Layer, Llm, OutputProjection, ParallelBlockGroup,
+    PredictStats, TrainingDataEventAscii, TrainingProgressEventAscii, TransformerBlock,
+    TransformerSequence, phase_strategy_config_ascii, training_phase_ascii,
 };
 use crate::tokenizer::{BpeTokenizer, BpeTokenizerConfig};
 use crate::train::{Dataset, DatasetType};
@@ -64,14 +70,14 @@ fn build_llm_from_tokenizer(bpe: crate::tokenizer::BpeTokenizer) -> Llm {
     let block2_7 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
     let block2_8 = TransformerBlock::new(crate::EMBEDDING_DIM, crate::HIDDEN_DIM);
 
-    let seq_2_1 = TransformerSequence::new(vec![block2_1, block2_2])
-        .expect("transformer_sequence_new_failed");
-    let seq_2_2 = TransformerSequence::new(vec![block2_3, block2_4])
-        .expect("transformer_sequence_new_failed");
-    let seq_2_3 = TransformerSequence::new(vec![block2_5, block2_6])
-        .expect("transformer_sequence_new_failed");
-    let seq_2_4 = TransformerSequence::new(vec![block2_7, block2_8])
-        .expect("transformer_sequence_new_failed");
+    let seq_2_1 =
+        TransformerSequence::new(vec![block2_1, block2_2]).expect("transformer_sequence_new_failed");
+    let seq_2_2 =
+        TransformerSequence::new(vec![block2_3, block2_4]).expect("transformer_sequence_new_failed");
+    let seq_2_3 =
+        TransformerSequence::new(vec![block2_5, block2_6]).expect("transformer_sequence_new_failed");
+    let seq_2_4 =
+        TransformerSequence::new(vec![block2_7, block2_8]).expect("transformer_sequence_new_failed");
 
     let parallel_block2 = ParallelBlockGroup::new(vec![
         Box::new(seq_2_1) as Box<dyn Layer>,
@@ -334,7 +340,6 @@ fn print_training_metrics_snapshot_ascii(m: &training_metrics_snapshot_ascii) {
     }
 }
 
-
 fn drain_training_progress_non_blocking(
     opt_rx: &mut Option<mpsc::Receiver<TrainingProgressEventAscii>>,
     metrics_shared: &Arc<Mutex<training_metrics_snapshot_ascii>>,
@@ -448,11 +453,14 @@ fn main() {
     let mut opt_progress_rx: Option<mpsc::Receiver<TrainingProgressEventAscii>> = None;
     let mut opt_snapshot_rx: Option<mpsc::Receiver<Vec<f32>>> = None;
 
+    // Online ingestion sender (main to training thread).
+    let mut opt_data_tx: Option<mpsc::Sender<TrainingDataEventAscii>> = None;
+
     // Training thread handle.
-    let mut opt_train_handle: Option<std::thread::JoinHandle<()>> = None;
+    let mut opt_train_handle: Option<thread::JoinHandle<()>> = None;
 
     {
-        let mut llm = llm_serve.lock().expect("llm_mutex_poisoned");
+        let llm = llm_serve.lock().expect("llm_mutex_poisoned");
         println!("\n=== MODEL INFORMATION ===");
         println!("Network architecture: {}", llm.network_description());
         println!(
@@ -472,6 +480,7 @@ fn main() {
         println!("  t Train (background, continuous learning)");
         println!("  b Training metrics");
         println!("  s Stop training");
+        println!("  n Add new training data file (online ingestion)");
         println!("  l Load checkpoint (serve model)");
         println!("  w Save checkpoint (serve model)");
         println!("  a Ask (serve model, parallel to training)");
@@ -498,10 +507,15 @@ fn main() {
         let s_cmd_lc = s_cmd.to_lowercase();
 
         if s_cmd_lc == "e" {
+            if let Some(tx) = opt_data_tx.as_ref() {
+                let _ = tx.send(TrainingDataEventAscii::shutdown);
+            }
+
             if let Some(h) = opt_train_handle.take() {
                 b_cancel_train.store(true, Ordering::SeqCst);
                 let _ = h.join();
             }
+
             println!("Exit.");
             break;
         }
@@ -532,6 +546,10 @@ fn main() {
             let (tx_snapshot, rx_snapshot) = mpsc::channel::<Vec<f32>>();
             opt_snapshot_rx = Some(rx_snapshot);
 
+            // Online data ingestion channel.
+            let (tx_data, rx_data) = mpsc::channel::<TrainingDataEventAscii>();
+            opt_data_tx = Some(tx_data.clone());
+
             let llm_for_train = Arc::clone(&llm_train);
             let metrics_for_train = Arc::clone(&metrics_shared);
             let cancel_for_train = Arc::clone(&b_cancel_train);
@@ -542,11 +560,59 @@ fn main() {
             opt_train_handle = Some(thread::spawn(move || {
                 let r_run = (|| -> Result<(), String> {
                     let i_snapshot_every_steps: usize = 200;
+
                     let i_epochs_total_pretrain = 30;
                     let i_epochs_total_train = 5000;
 
+                    let cl_cfg_pre = ContinuousLearningConfig {
+                        v_branch_participation_p: vec![0.75, 0.75, 0.75, 0.75],
+                        i_min_active_branches: 2,
+                        b_scale_by_inverse_participation: true,
+                        u64_mask_seed: 20260213,
+                    };
 
-                    // Phase 1: pretraining.
+                    let cl_cfg_tune = ContinuousLearningConfig {
+                        v_branch_participation_p: vec![0.60, 0.70, 0.80, 0.65],
+                        i_min_active_branches: 2,
+                        b_scale_by_inverse_participation: true,
+                        u64_mask_seed: 20260214,
+                    };
+
+                    let cfg_phase_pre = phase_strategy_config_ascii {
+                        e_phase: training_phase_ascii::realtime,
+                        b_enable_ema_branch_selection: true,
+                        i_ema_warmup_steps: 500,
+
+                        b_enable_replay: true,
+                        d_replay_p_start: 0.0,
+                        d_replay_p_max: 0.25,
+                        i_replay_ramp_steps: 2000,
+
+                        b_enable_autonomous_expansion: true,
+                        i_expand_check_every_steps: 500,
+                        d_eta_injection: 0.05,
+
+                        i_max_total_branches: 16,
+                    };
+
+                    let cfg_phase_tune = phase_strategy_config_ascii {
+                        e_phase: training_phase_ascii::realtime,
+                        b_enable_ema_branch_selection: true,
+                        i_ema_warmup_steps: 500,
+
+                        b_enable_replay: true,
+                        d_replay_p_start: 0.0,
+                        d_replay_p_max: 0.25,
+                        i_replay_ramp_steps: 2000,
+
+                        b_enable_autonomous_expansion: true,
+                        i_expand_check_every_steps: 500,
+                        d_eta_injection: 0.05,
+
+                        i_max_total_branches: 16,
+                    };
+
+                    // Update phase in shared metrics.
                     {
                         let mut m = metrics_for_train
                             .lock()
@@ -557,66 +623,29 @@ fn main() {
                         m.s_last_error = "".to_string();
                     }
 
+                    // Training orchestration: if available, keep receiver alive across phases.
+                    // NOTE: This method must exist in layer.rs for the robust solution.
                     {
                         let mut llm = llm_for_train.lock().map_err(|_| "llm_lock_failed".to_string())?;
 
-                        // Continuous learning config for a 4-branch ParallelBlockGroup.
-                        // p_i is per-branch availability; min participation stabilizes behavior.
-                        let cl_cfg = ContinuousLearningConfig {
-                            v_branch_participation_p: vec![0.75, 0.75, 0.75, 0.75],
-                            i_min_active_branches: 2,
-                            b_scale_by_inverse_participation: true,
-                            u64_mask_seed: 20260213,
-                        };
-
-                        llm.train_with_progress_continuous_learning_ascii(
+                        llm.train_two_phase_with_progress_online_ascii(
                             v_pretraining_examples.iter().map(|s| s.as_str()).collect(),
                             i_epochs_total_pretrain,
                             0.0005,
-                            Arc::clone(&cancel_for_train),
-                            tx_progress.clone(),
                             "pretraining",
-                            Some(cl_cfg),
-                            i_snapshot_every_steps,
-                            Some(tx_snapshot.clone()),
-                        )?;
-                    }
-
-                    if cancel_for_train.load(Ordering::SeqCst) {
-                        return Ok(());
-                    }
-
-                    // Phase 2: instruction tuning.
-                    {
-                        let mut m = metrics_for_train
-                            .lock()
-                            .map_err(|_| "metrics_lock_failed".to_string())?;
-                        m.s_phase = "instruction_tuning".to_string();
-                        m.i_epoch_current = 0;
-                        m.i_epochs_total = i_epochs_total_train;
-                        m.s_last_error = "".to_string();
-                    }
-
-                    {
-                        let mut llm = llm_for_train.lock().map_err(|_| "llm_lock_failed".to_string())?;
-
-                        let cl_cfg = ContinuousLearningConfig {
-                            v_branch_participation_p: vec![0.60, 0.70, 0.80, 0.65],
-                            i_min_active_branches: 2,
-                            b_scale_by_inverse_participation: true,
-                            u64_mask_seed: 20260214,
-                        };
-
-                        llm.train_with_progress_continuous_learning_ascii(
+                            Some(cl_cfg_pre),
+                            cfg_phase_pre,
                             v_chat_training_examples.iter().map(|s| s.as_str()).collect(),
                             i_epochs_total_train,
                             0.0001,
+                            "instruction_tuning",
+                            Some(cl_cfg_tune),
+                            cfg_phase_tune,
                             Arc::clone(&cancel_for_train),
                             tx_progress.clone(),
-                            "instruction_tuning",
-                            Some(cl_cfg),
                             i_snapshot_every_steps,
                             Some(tx_snapshot.clone()),
+                            rx_data,
                         )?;
                     }
 
@@ -654,7 +683,10 @@ fn main() {
 
         if s_cmd_lc == "b" {
             drain_training_progress_non_blocking(&mut opt_progress_rx, &metrics_shared, &b_cancel_train);
-            let m = metrics_shared.lock().expect("metrics_mutex_poisoned").clone();
+            let m = metrics_shared
+                .lock()
+                .expect("metrics_mutex_poisoned")
+                .clone();
             print_training_metrics_snapshot_ascii(&m);
             continue;
         }
@@ -669,6 +701,7 @@ fn main() {
                 if let Some(h) = opt_train_handle.take() {
                     let _ = h.join();
                 }
+                opt_data_tx = None;
                 continue;
             }
 
@@ -679,11 +712,58 @@ fn main() {
                 m.s_phase = "cancel_requested".to_string();
             }
 
+            if let Some(tx) = opt_data_tx.as_ref() {
+                let _ = tx.send(TrainingDataEventAscii::shutdown);
+            }
+
             if let Some(h) = opt_train_handle.take() {
                 let _ = h.join();
             }
 
+            opt_data_tx = None;
             println!("Training stop requested and thread joined.");
+            continue;
+        }
+
+        if s_cmd_lc == "n" {
+            let b_running = {
+                let m = metrics_shared.lock().expect("metrics_mutex_poisoned");
+                m.b_running
+            };
+            if !b_running {
+                println!("Training not running. Online ingestion requires a running training thread.");
+                continue;
+            }
+
+            let tx = match opt_data_tx.as_ref() {
+                Some(v) => v,
+                None => {
+                    println!("Online ingestion channel not available.");
+                    continue;
+                }
+            };
+
+            print!("Enter path to JSON training file (array of strings): ");
+            let _ = std::io::stdout().flush();
+
+            let s_path = match read_line_ascii_trimmed() {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("Input error: {}", e);
+                    continue;
+                }
+            };
+
+            if s_path.trim().is_empty() {
+                println!("Empty path.");
+                continue;
+            }
+
+            match tx.send(TrainingDataEventAscii::add_training_file_json_array { s_path: s_path.clone() }) {
+                Ok(()) => println!("Queued training data file for ingestion: {}", s_path),
+                Err(_) => println!("Failed to send ingestion event (receiver not alive)."),
+            }
+
             continue;
         }
 
@@ -805,7 +885,8 @@ fn main() {
                     Ok((s_out, st)) => {
                         println!("Model output: {}", s_out);
                         let llm = llm_serve.lock().expect("llm_mutex_poisoned");
-                        let m = compute_predict_metrics_ascii(&llm, &s_formatted, &s_out, d_ms, Some(&st));
+                        let m =
+                            compute_predict_metrics_ascii(&llm, &s_formatted, &s_out, d_ms, Some(&st));
                         print_predict_metrics_ascii(&m);
                     }
                     Err(e) => {
